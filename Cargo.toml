@@ -1,5 +1,5 @@
 [package]
-name = "proxy_printer"
+name = "tcp_proxy"
 version = "0.1.0"
 edition = "2021"
 
@@ -8,10 +8,15 @@ edition = "2021"
 [dependencies]
 clap = { version = "4.4.10", features = ["derive"] }
 anyhow = "1.0.75"
+scopeguard = "1.2.0"
 
+ppp = { version = "2.2.0" }
 nix = { version = "0.27.1", features = ["socket", "net", "uio", "zerocopy"] }
 socket2 = { version = "0.5.5", features = [] }
 tokio = { version = "1.34.0", features = ["full"] }
+tokio-splice = "0.2.0"
+
 
 tracing = { version = "0.1.40", features = ["log"] }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "fmt", "local-time"] }
+url = "2.5.0"
