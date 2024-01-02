@@ -124,7 +124,7 @@ fn parse_tunnel_dest(
 ) -> Result<(Host<String>, u16, BTreeMap<String, String>), io::Error> {
     use std::io::Error;
 
-    let Ok(remote) = Url::parse(&format!("fake://{}", remaining)) else {
+    let Ok(remote) = Url::parse(&format!("https://{}", remaining)) else {
         return Err(Error::new(
             ErrorKind::InvalidInput,
             format!("cannot parse remote from {}", remaining),
@@ -138,7 +138,7 @@ fn parse_tunnel_dest(
         ));
     };
 
-    let Some(remote_port) = remote.port() else {
+    let Some(remote_port) = remote.port_or_known_default() else {
         return Err(Error::new(
             ErrorKind::InvalidInput,
             format!("cannot parse remote port from {}", remaining),
