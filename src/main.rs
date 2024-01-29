@@ -1,6 +1,13 @@
+mod peekable_stream;
+
+use crate::peekable_stream::PeekableStream;
 use anyhow::Context;
 use clap::Parser;
-use socket2::{Domain, Protocol, SockAddr};
+use rustls::internal::msgs::deframer::MessageDeframer;
+use rustls::internal::msgs::handshake::{ConvertServerNameList, HandshakePayload};
+use rustls::internal::msgs::message::{Message, MessagePayload};
+use rustls::internal::record_layer::RecordLayer;
+use socket2::{Domain, SockAddr};
 use std::collections::BTreeMap;
 use std::io;
 use std::io::ErrorKind;
@@ -20,12 +27,19 @@ use url::Url;
 const LOCAL_ADDR_V6: SocketAddr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0));
 const LOCAL_ADDR_V4: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Protocol {
+    Tcp,
+    Tls,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct LocalToRemote {
+    protocol: Protocol,
     listen_addr: SocketAddr,
     remote: SocketAddr,
     use_proxy_protocol: bool,
-    timeout: Duration,
+    cnx_max_duration: Duration,
     connect_timeout: Duration,
 }
 
@@ -58,10 +72,39 @@ fn parse_tunnel_arg(arg: &str) -> Result<LocalToRemote, io::Error> {
                 }
             };
             Ok(LocalToRemote {
+                protocol: Protocol::Tcp,
                 listen_addr: local_bind,
                 remote,
                 use_proxy_protocol: options.get("proxy_protocol").is_some(),
-                timeout: {
+                cnx_max_duration: {
+                    let timeout_min: u64 = options
+                        .get("timeout")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(10u64);
+                    Duration::from_secs(60 * timeout_min)
+                },
+                connect_timeout: Duration::from_secs(10),
+            })
+        }
+        "tls://" => {
+            let (local_bind, remaining) = parse_local_bind(&arg[6..])?;
+            let (dest_host, dest_port, options) = parse_tunnel_dest(remaining)?;
+            let remote = match dest_host {
+                Host::Ipv4(ip) => SocketAddr::V4(SocketAddrV4::new(ip, dest_port)),
+                Host::Ipv6(ip) => SocketAddr::V6(SocketAddrV6::new(ip, dest_port, 0, 0)),
+                Host::Domain(_) => {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("Invalid local protocol for tunnel {}", arg),
+                    ))
+                }
+            };
+            Ok(LocalToRemote {
+                protocol: Protocol::Tls,
+                listen_addr: local_bind,
+                remote,
+                use_proxy_protocol: options.get("proxy_protocol").is_some(),
+                cnx_max_duration: {
                     let timeout_min: u64 = options
                         .get("timeout")
                         .and_then(|s| s.parse().ok())
@@ -185,15 +228,42 @@ async fn main() -> anyhow::Result<()> {
                     peer = %peer_addr,
                     remote = %local.remote,
                     proxy = local.use_proxy_protocol,
-                    timeout = ?local.timeout);
+                    timeout = ?local.cnx_max_duration);
+
                 let proxied_client_loop = async move {
+                    if local.protocol == Protocol::Tls {
+                        let mut tls_deframer = MessageDeframer::default();
+                        let mut record_layer = RecordLayer::new();
+                        let mut peek_stream = PeekableStream::new(&stream);
+
+                        stream.readable().await.unwrap();
+                        tls_deframer.read(&mut peek_stream).unwrap();
+                        let msg = tls_deframer.pop(&mut record_layer).unwrap().unwrap();
+
+                        let msg = Message::try_from(msg.message).unwrap();
+                        let snv_names = match &msg.payload {
+                            MessagePayload::Handshake { parsed, .. } => match &parsed.payload {
+                                HandshakePayload::ClientHello(msg) => {
+                                    let srv_names = msg.get_sni_extension();
+                                    srv_names
+                                }
+                                _ => unreachable!("unexpected handshake payload"),
+                            },
+                            _ => unreachable!("unexpected message type"),
+                        };
+
+                        if let Some(srv_name) = snv_names.and_then(|s| s.get_single_hostname()) {
+                            info!("SNI: {:?}", srv_name);
+                        }
+                    }
+
                     if let Err(err) = handle_client(local, stream, peer_addr).await {
                         warn!("{:?}", err);
                     }
                 }
                 .instrument(span);
 
-                tokio::spawn(timeout(local.timeout, proxied_client_loop));
+                tokio::spawn(timeout(local.cnx_max_duration, proxied_client_loop));
             }
         };
 
@@ -208,7 +278,7 @@ fn create_socket(bind: SocketAddr) -> anyhow::Result<socket2::Socket> {
     let sock = socket2::Socket::new(
         Domain::for_address(bind),
         socket2::Type::STREAM,
-        Some(Protocol::TCP),
+        Some(socket2::Protocol::TCP),
     )?;
     sock.set_reuse_address(true)?;
     //sock.set_ip_transparent(true)?;
@@ -262,7 +332,7 @@ async fn handle_client(
         sock.write_all(proxy_protocol_header.as_slice()).await?;
     }
 
-    let timeout = tokio::time::sleep(local.timeout);
+    let timeout = tokio::time::sleep(local.cnx_max_duration);
     select! {
         biased;
 
@@ -273,7 +343,7 @@ async fn handle_client(
         }
 
         _ = timeout => {
-           warn!("timeout of {:?} elapsed. Closing cnx", local.timeout);
+           warn!("timeout of {:?} elapsed. Closing cnx", local.cnx_max_duration);
         }
     }
 
