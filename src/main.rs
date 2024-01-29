@@ -1,3 +1,4 @@
+use anyhow::Context;
 use clap::Parser;
 use socket2::{Domain, Protocol, SockAddr};
 use std::collections::BTreeMap;
@@ -11,7 +12,7 @@ use tokio::net::TcpStream;
 use tokio::select;
 use tokio::time::timeout;
 use tokio_splice::zero_copy_bidirectional;
-use tracing::{error, info, instrument, warn, Level};
+use tracing::{error, info, info_span, warn, Instrument, Level};
 use tracing_subscriber::EnvFilter;
 use url::Host;
 use url::Url;
@@ -25,6 +26,7 @@ struct LocalToRemote {
     remote: SocketAddr,
     use_proxy_protocol: bool,
     timeout: Duration,
+    connect_timeout: Duration,
 }
 
 /// Tcp Proxy
@@ -66,6 +68,7 @@ fn parse_tunnel_arg(arg: &str) -> Result<LocalToRemote, io::Error> {
                         .unwrap_or(10u64);
                     Duration::from_secs(60 * timeout_min)
                 },
+                connect_timeout: Duration::from_secs(10),
             })
         }
         _ => Err(Error::new(
@@ -178,11 +181,17 @@ async fn main() -> anyhow::Result<()> {
                     }
                 };
 
+                let span = info_span!("cnx",
+                    peer = %peer_addr,
+                    remote = %local.remote,
+                    proxy = local.use_proxy_protocol,
+                    timeout = ?local.timeout);
                 let proxied_client_loop = async move {
                     if let Err(err) = handle_client(local, stream, peer_addr).await {
                         warn!("{:?}", err);
                     }
-                };
+                }
+                .instrument(span);
 
                 tokio::spawn(timeout(local.timeout, proxied_client_loop));
             }
@@ -211,7 +220,6 @@ fn create_socket(bind: SocketAddr) -> anyhow::Result<socket2::Socket> {
     Ok(sock)
 }
 
-#[instrument(level="info", skip_all, fields(peer = %peer_addr, remote = %local.remote, proxy = local.use_proxy_protocol, timeout = ?local.timeout))]
 async fn handle_client(
     local: LocalToRemote,
     mut stream: TcpStream,
@@ -228,13 +236,21 @@ async fn handle_client(
         create_socket(LOCAL_ADDR_V6)?
     };
 
-    match sock.connect(&SockAddr::from(local.remote)) {
-        Ok(_) => Ok(()),
-        Err(err) if matches!(err.raw_os_error(), Some(nix::libc::EINPROGRESS)) => Ok(()),
+    let mut sock = match sock.connect(&SockAddr::from(local.remote)) {
+        Ok(_) => TcpStream::from_std(std::net::TcpStream::from(sock)),
+        // wait for the socket to be connected if not already
+        Err(err) if matches!(err.raw_os_error(), Some(nix::libc::EINPROGRESS)) => {
+            let sock = TcpStream::from_std(std::net::TcpStream::from(sock))?;
+            tokio::time::timeout(local.connect_timeout, sock.writable())
+                .await
+                .with_context(|| {
+                    format!("Cannot connect to remote after {:?}", local.connect_timeout)
+                })??;
+
+            Ok(sock)
+        }
         Err(err) => Err(err),
     }?;
-
-    let mut sock = TcpStream::from_std(std::net::TcpStream::from(sock))?;
 
     if local.use_proxy_protocol {
         let proxy_protocol_header = ppp::v2::Builder::with_addresses(
