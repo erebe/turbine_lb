@@ -1,3 +1,4 @@
+use std::cmp::max;
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
 
@@ -30,7 +31,6 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::time::timeout;
 use tokio::{pin, select};
 use tokio_splice::zero_copy_bidirectional;
 use tracing::{error, field, info, info_span, span, warn, Instrument, Level, Span};
@@ -55,10 +55,6 @@ struct Rule {
     pub protocol: Protocol,
     pub listen_addr: NonEmpty<SocketAddr>,
     pub upstreams: NonEmpty<Upstream>,
-    #[serde(deserialize_with = "deserialize_duration")]
-    pub cnx_max_duration: Duration,
-    #[serde(deserialize_with = "deserialize_duration")]
-    pub connect_timeout: Duration,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -69,6 +65,11 @@ struct Upstream {
     pub round_robin_counter: Arc<AtomicUsize>,
     pub proxy_protocol: bool,
     pub r#match: Match,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub cnx_max_duration: Duration,
+    #[serde(default = "default_connect_timeout")]
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub connect_timeout: Duration,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -76,6 +77,10 @@ pub enum Match {
     Any,
     Sni(String),
     DestinationPort(u16),
+}
+
+fn default_connect_timeout() -> Duration {
+    Duration::from_secs(10)
 }
 
 /// Tcp Proxy
@@ -120,7 +125,7 @@ async fn main() -> anyhow::Result<()> {
         let tcp_server = TcpListener::from_std(std::net::TcpListener::from(tcp_server))?;
         let mut shutdown_rx = shutdown_tx.subscribe();
 
-        let span = info_span!("server", listen_addr = %listen_addr, protocol = ?rule.protocol);
+        let server_span = info_span!("lb", listen_addr = %listen_addr, protocol = ?rule.protocol);
         let server_loop = async move {
             info!("starting");
             let _guard = scopeguard::guard((), |_| {
@@ -147,18 +152,16 @@ async fn main() -> anyhow::Result<()> {
                 };
 
                 let span = span!(
-                    parent: Span::none(),
+                    //parent: Span::none(),
                     Level::INFO,
                     "cnx",
                     peer = %peer_addr,
                     upstream = field::Empty,
                     upstream_addr = field::Empty,
                     proxy = field::Empty,
-                    timeout = ?rule.cnx_max_duration);
+                    timeout = field::Empty);
 
-                let cnx_max_duration = rule.cnx_max_duration;
                 let rule = rule.clone();
-
                 let proxied_client_loop = async move {
                     TASK_COUNTER.fetch_add(1, Ordering::Relaxed);
                     let _guard = scopeguard::guard((), |_| {
@@ -171,10 +174,10 @@ async fn main() -> anyhow::Result<()> {
                 }
                 .instrument(span);
 
-                tokio::spawn(timeout(cnx_max_duration, proxied_client_loop));
+                tokio::spawn(proxied_client_loop);
             }
         }
-        .instrument(span);
+        .instrument(server_span);
 
         tokio::spawn(server_loop);
     }
@@ -208,6 +211,7 @@ fn create_socket(bind: SocketAddr) -> anyhow::Result<socket2::Socket> {
         Some(socket2::Protocol::TCP),
     )?;
     sock.set_reuse_address(true)?;
+    sock.set_reuse_port(true)?;
     //sock.set_ip_transparent(true)?;
     sock.set_keepalive(true)?;
     sock.set_nodelay(true)?;
@@ -265,6 +269,10 @@ async fn handle_client(
     span.record("upstream", upstream.name.as_str());
     span.record("upstream_addr", upstream_addr.to_string());
     span.record("proxy", upstream.proxy_protocol);
+    span.record(
+        "timeout",
+        format!("{}m", max(upstream.cnx_max_duration.as_secs(), 1) / 60),
+    );
 
     info!("connecting to upstream");
     let sock = if upstream_addr.is_ipv4() {
@@ -279,10 +287,13 @@ async fn handle_client(
         // wait for the socket to be connected if not already
         Err(err) if matches!(err.raw_os_error(), Some(nix::libc::EINPROGRESS)) => {
             let sock = TcpStream::from_std(std::net::TcpStream::from(sock))?;
-            tokio::time::timeout(local.connect_timeout, sock.writable())
+            tokio::time::timeout(upstream.connect_timeout, sock.writable())
                 .await
                 .with_context(|| {
-                    format!("Cannot connect to remote after {:?}", local.connect_timeout)
+                    format!(
+                        "Cannot connect to remote after {:?}",
+                        upstream.connect_timeout
+                    )
                 })??;
 
             Ok(sock)
@@ -301,9 +312,8 @@ async fn handle_client(
         sock.write_all(proxy_protocol_header.as_slice()).await?;
     }
 
-    let timeout = tokio::time::sleep(local.cnx_max_duration);
-
     // Data transfer loop
+    let timeout = tokio::time::sleep(upstream.cnx_max_duration);
     select! {
         biased;
 
@@ -314,7 +324,7 @@ async fn handle_client(
         }
 
         _ = timeout => {
-           warn!("timeout of {:?} elapsed. Closing cnx", local.cnx_max_duration);
+           warn!("timeout of {:?} elapsed. Closing cnx", upstream.cnx_max_duration);
         }
     }
 
