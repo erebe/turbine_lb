@@ -29,10 +29,11 @@ use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::select;
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::time::timeout;
+use tokio::{pin, select};
 use tokio_splice::zero_copy_bidirectional;
-use tracing::{error, field, info, info_span, warn, Instrument, Level, Span};
+use tracing::{error, field, info, info_span, span, warn, Instrument, Level, Span};
 use tracing_subscriber::EnvFilter;
 
 const LOCAL_ADDR_V6: SocketAddr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0));
@@ -86,6 +87,8 @@ struct CmdLine {
     config: PathBuf,
 }
 
+static TASK_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cmd_line: CmdLine = CmdLine::parse();
@@ -109,23 +112,44 @@ async fn main() -> anyhow::Result<()> {
             .map(move |addr| (addr, rule.clone()))
     });
 
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+
     for (listen_addr, rule) in rules {
-        info!("{:?} server listening on {}", rule.protocol, listen_addr);
         let tcp_server = create_socket(listen_addr)?;
         tcp_server.listen(4096)?;
         let tcp_server = TcpListener::from_std(std::net::TcpListener::from(tcp_server))?;
+        let mut shutdown_rx = shutdown_tx.subscribe();
 
+        let span = info_span!("server", listen_addr = %listen_addr, protocol = ?rule.protocol);
         let server_loop = async move {
+            info!("starting");
+            let _guard = scopeguard::guard((), |_| {
+                info!("stopped");
+            });
+            let shutdown_signal = shutdown_rx.recv();
+            pin!(shutdown_signal);
+
             loop {
-                let (stream, peer_addr) = match tcp_server.accept().await {
-                    Ok(cnx) => cnx,
-                    Err(err) => {
-                        error!("error accepting new connections: {:?}", err);
-                        continue;
+                let (stream, peer_addr) = select! {
+                    biased;
+                    _ = &mut shutdown_signal => {
+                        warn!("Receive signal to shutdown");
+                        break;
+                    }
+
+                    ret = tcp_server.accept() => match ret {
+                        Ok(cnx) => cnx,
+                        Err(err) => {
+                            error!("error accepting new connections: {:?}", err);
+                            continue;
+                        }
                     }
                 };
 
-                let span = info_span!("cnx",
+                let span = span!(
+                    parent: Span::none(),
+                    Level::INFO,
+                    "cnx",
                     peer = %peer_addr,
                     upstream = field::Empty,
                     upstream_addr = field::Empty,
@@ -134,7 +158,13 @@ async fn main() -> anyhow::Result<()> {
 
                 let cnx_max_duration = rule.cnx_max_duration;
                 let rule = rule.clone();
+
                 let proxied_client_loop = async move {
+                    TASK_COUNTER.fetch_add(1, Ordering::Relaxed);
+                    let _guard = scopeguard::guard((), |_| {
+                        TASK_COUNTER.fetch_sub(1, Ordering::Relaxed);
+                    });
+
                     if let Err(err) = handle_client(&rule, stream, peer_addr).await {
                         warn!("{:?}", err);
                     }
@@ -143,12 +173,31 @@ async fn main() -> anyhow::Result<()> {
 
                 tokio::spawn(timeout(cnx_max_duration, proxied_client_loop));
             }
-        };
+        }
+        .instrument(span);
 
         tokio::spawn(server_loop);
     }
 
-    let _ = tokio::signal::ctrl_c().await;
+    let mut sigterm = signal(SignalKind::terminate()).unwrap();
+    let mut sigint = signal(SignalKind::interrupt()).unwrap();
+    select! {
+        _ = sigterm.recv() => println!("Receive SIGTERM"),
+        _ = sigint.recv() => println!("Receive SIGTINT"),
+    }
+    let _ = shutdown_tx.send(());
+
+    // Wait to drain all the connections
+    loop {
+        let nb_task = TASK_COUNTER.load(Ordering::Relaxed);
+        if nb_task == 0 {
+            break;
+        }
+
+        info!("Waiting for {} cnx to shutdown", nb_task);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
     Ok(())
 }
 
