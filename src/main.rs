@@ -7,13 +7,18 @@ use rustls::internal::msgs::deframer::MessageDeframer;
 use rustls::internal::msgs::handshake::{ConvertServerNameList, HandshakePayload};
 use rustls::internal::msgs::message::{Message, MessagePayload};
 use rustls::internal::record_layer::RecordLayer;
+use rustls::server::DnsName;
 use socket2::{Domain, SockAddr};
 use std::collections::BTreeMap;
+use std::fs::File;
 use std::io;
-use std::io::ErrorKind;
+use std::io::{BufReader, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::str::FromStr;
 use std::time::Duration;
+use serde::{Deserialize, Serialize};
+use duration_str::deserialize_duration;
+
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::select;
@@ -27,7 +32,7 @@ use url::Url;
 const LOCAL_ADDR_V6: SocketAddr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0));
 const LOCAL_ADDR_V4: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 enum Protocol {
     Tcp,
     Tls,
@@ -41,6 +46,35 @@ struct LocalToRemote {
     use_proxy_protocol: bool,
     cnx_max_duration: Duration,
     connect_timeout: Duration,
+}
+
+#[derive(Debug, Deserialize)]
+struct Config {
+   pub rules: Vec<Rule>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Rule {
+    pub protocol: Protocol,
+    pub listen_addr: Vec<SocketAddr>,
+    pub upstreams: Vec<Upstream>,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub cnx_max_duration: Duration,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub connect_timeout: Duration,
+}
+
+#[derive(Debug, Deserialize)]
+struct Upstream {
+    pub addrs: Vec<SocketAddr>,
+    pub proxy_protocol: bool,
+    pub r#match: Match,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum Match {
+    Any,
+    Sni(String)
 }
 
 /// Tcp Proxy
@@ -207,6 +241,10 @@ async fn main() -> anyhow::Result<()> {
                 .from_env_lossy(),
         )
         .init();
+    let config: Config = serde_yaml::from_reader(BufReader::new(File::open("config.yaml")?))?;
+    info!("{:?}", config);
+    let  x = serde_yaml::to_string(&Match::Sni("toto".to_string()));
+    info!("{:?}", x);
 
     for local in cmd_line.local_to_remote {
         info!("TCP server listening on {}", local.listen_addr);
@@ -231,32 +269,6 @@ async fn main() -> anyhow::Result<()> {
                     timeout = ?local.cnx_max_duration);
 
                 let proxied_client_loop = async move {
-                    if local.protocol == Protocol::Tls {
-                        let mut tls_deframer = MessageDeframer::default();
-                        let mut record_layer = RecordLayer::new();
-                        let mut peek_stream = PeekableStream::new(&stream);
-
-                        stream.readable().await.unwrap();
-                        tls_deframer.read(&mut peek_stream).unwrap();
-                        let msg = tls_deframer.pop(&mut record_layer).unwrap().unwrap();
-
-                        let msg = Message::try_from(msg.message).unwrap();
-                        let snv_names = match &msg.payload {
-                            MessagePayload::Handshake { parsed, .. } => match &parsed.payload {
-                                HandshakePayload::ClientHello(msg) => {
-                                    let srv_names = msg.get_sni_extension();
-                                    srv_names
-                                }
-                                _ => unreachable!("unexpected handshake payload"),
-                            },
-                            _ => unreachable!("unexpected message type"),
-                        };
-
-                        if let Some(srv_name) = snv_names.and_then(|s| s.get_single_hostname()) {
-                            info!("SNI: {:?}", srv_name);
-                        }
-                    }
-
                     if let Err(err) = handle_client(local, stream, peer_addr).await {
                         warn!("{:?}", err);
                     }
@@ -299,6 +311,13 @@ async fn handle_client(
     let _guard = scopeguard::guard((), |_| {
         info!("connections closed");
     });
+
+    if local.protocol == Protocol::Tls {
+        if let Some(sni) = extract_sni(&stream).await? {
+            info!("SNI: {}", sni.as_ref());
+        }
+    }
+
 
     let sock = if local.remote.is_ipv4() {
         create_socket(LOCAL_ADDR_V4)?
@@ -348,4 +367,41 @@ async fn handle_client(
     }
 
     Ok(())
+}
+
+async fn extract_sni(stream: &TcpStream) -> anyhow::Result<Option<DnsName>> {
+    let mut tls_deframer = MessageDeframer::default();
+    let mut record_layer = RecordLayer::new();
+    let mut peek_stream = PeekableStream::new(stream);
+
+    stream.readable().await?;
+    tls_deframer.read(&mut peek_stream)?;
+    let msg = tls_deframer
+        .pop(&mut record_layer)?
+        .with_context(|| "No TLS frame read")?;
+    let msg = Message::try_from(msg.message)?;
+    let snv_names = match &msg.payload {
+        MessagePayload::Handshake { parsed, .. } => match &parsed.payload {
+            HandshakePayload::ClientHello(msg) => {
+                let srv_names = msg.get_sni_extension();
+                srv_names
+            }
+            msg => {
+                return Err(anyhow::Error::msg(format!(
+                    "Invalid TLS msg, expecting client hello handshake: {:?}",
+                    msg
+                )))
+            }
+        },
+        msg => {
+            return Err(anyhow::Error::msg(format!(
+                "Invalid TLS msg, expecting client hello handshake: {:?}",
+                msg
+            )))
+        }
+    };
+
+    let sni = snv_names.and_then(|s| s.get_single_hostname());
+
+    anyhow::Ok(sni.map(|x| x.to_owned()))
 }

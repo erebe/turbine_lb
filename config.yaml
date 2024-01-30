@@ -1,0 +1,12 @@
+rules:
+  - listen_addr: 
+      - "[::1]:1080"
+      - "[::1]:1081"
+    protocol: Tcp
+    cnx_max_duration: 10m
+    connect_timeout: 10s
+    upstreams:
+      - proxy_protocol: false
+        match: !Sni ws.erebe.eu
+        addrs: 
+          - "[::1]:8080"
