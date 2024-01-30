@@ -1,12 +1,56 @@
 rules:
-  - listen_addr: 
-      - "[::1]:1080"
-      - "[::1]:1081"
-    protocol: Tcp
-    cnx_max_duration: 10m
-    connect_timeout: 10s
-    upstreams:
-      - proxy_protocol: false
-        match: !Sni ws.erebe.eu
-        addrs: 
-          - "[::1]:8080"
+- listen_addr: 
+    - "[::]:25"
+    - "[::]:587"
+    - "[::]:993"
+  protocol: Tcp
+  cnx_max_duration: 5m
+  connect_timeout: 10s
+  upstreams:
+    - name: smtp
+      match: !DestinationPort 25
+      addrs: 
+        - "[fd00:cafe::5]:25"
+      proxy_protocol: true
+
+    - name: smtps
+      match: !DestinationPort 587
+      addrs: 
+        - "[fd00:cafe::5]:587"
+      proxy_protocol: true
+
+    - name: imaps
+      match: !DestinationPort 993
+      addrs: 
+        - "[fd00:cafe::5]:993"
+      proxy_protocol: false
+
+- listen_addr: 
+    - "[::]:443"
+  protocol: Tls
+  cnx_max_duration: 5m
+  connect_timeout: 10s
+  upstreams:
+    - name: wstunnel
+      match: !Sni ws.erebe.eu
+      addrs: 
+        - "[fd00:cafe::254]:8084"
+      proxy_protocol: false
+
+    - name: nginx-https
+      match: !Any
+      addrs: 
+        - "[fd00:cafe::254]:444"
+      proxy_protocol: true
+
+- listen_addr: 
+    - "[::]:80"
+  protocol: Tcp
+  cnx_max_duration: 5m
+  connect_timeout: 10s
+  upstreams:
+    - name: nginx-http
+      match: !Any
+      addrs: 
+        - "[fd00:cafe::254]:81"
+      proxy_protocol: true

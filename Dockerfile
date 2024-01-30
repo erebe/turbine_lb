@@ -50,6 +50,7 @@ WORKDIR /home/app
 
 ARG PROFILE=release
 COPY --from=builder_release  /build/target/${PROFILE}/tcp_proxy tcp_proxy
+COPY config.yaml .
 
 ENV RUST_LOG="INFO"
 EXPOSE 8080
