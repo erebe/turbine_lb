@@ -1,33 +1,7 @@
 rules:
-- listen_addr: 
-    - "[::]:25"
-    - "[::]:587"
-    - "[::]:993"
-  protocol: Tcp
-  upstreams:
-    - name: smtp
-      match: !DestinationPort 25
-      addrs: 
-        - "[fd00:cafe::5]:25"
-      proxy_protocol: true
-      cnx_max_duration: 5m
-
-    - name: smtps
-      match: !DestinationPort 587
-      addrs: 
-        - "[fd00:cafe::5]:587"
-      proxy_protocol: true
-      cnx_max_duration: 5m
-
-    - name: imaps
-      match: !DestinationPort 993
-      addrs: 
-        - "[fd00:cafe::5]:993"
-      proxy_protocol: false
-      cnx_max_duration: 10m
 
 - listen_addr: 
-    - "[::]:443"
+    - "[::]:4443"
   protocol: Tls
   upstreams:
     - name: wstunnel
@@ -40,17 +14,6 @@ rules:
     - name: nginx-https
       match: !Any
       addrs: 
-        - "[fd00:cafe::254]:444"
-      proxy_protocol: true
-      cnx_max_duration: 10m
-
-- listen_addr: 
-    - "[::]:80"
-  protocol: Tcp
-  upstreams:
-    - name: nginx-http
-      match: !Any
-      addrs: 
-        - "[fd00:cafe::254]:81"
-      proxy_protocol: true
+      - "62.210.156.7:80"
+      proxy_protocol: false
       cnx_max_duration: 10m

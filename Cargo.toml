@@ -15,7 +15,10 @@ nix = { version = "0.27.1", features = ["socket", "net", "uio", "zerocopy"] }
 socket2 = { version = "0.5.5", features = [] }
 tokio = { version = "1.34.0", features = ["full"] }
 tokio-splice = "0.2.0"
+tokio-rustls = {  version = "0.24.1", features = ["tls12"] }
 rustls = { version = "0.21.10", features = ["tls12", "dangerous_configuration"] }
+rustls-pemfile = {  version = "2.0.0", features = [] }
+ktls = {  version = "4.0.0", features = [] }
 serde = {  version = "1.0.196", features = ["derive"] }
 serde_yaml = {  version = "0.9.31", features = [] }
 duration-str = {  version = "0.7.1", features = [] }

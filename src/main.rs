@@ -7,6 +7,7 @@ use tikv_jemallocator::Jemalloc;
 static GLOBAL: Jemalloc = Jemalloc;
 
 mod peekable_stream;
+mod tls;
 
 use crate::peekable_stream::PeekableStream;
 use anyhow::Context;
@@ -21,18 +22,22 @@ use rustls::server::DnsName;
 use serde::Deserialize;
 use socket2::{Domain, SockAddr};
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Error, IoSlice};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::path::PathBuf;
+use std::os::fd::{AsRawFd, RawFd};
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
+use ktls::KtlsStream;
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, Interest, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::{pin, select};
-use tokio_splice::zero_copy_bidirectional;
+use tokio_splice::{Stream, zero_copy_bidirectional};
 use tracing::{error, field, info, info_span, span, warn, Instrument, Level, Span};
 use tracing_subscriber::EnvFilter;
 
@@ -312,12 +317,27 @@ async fn handle_client(
         sock.write_all(proxy_protocol_header.as_slice()).await?;
     }
 
+    let tls_acceptor = tls::tls_acceptor(tls::load_certificates_from_pem(&Path::new("/home/erebe/progs/wstunnel/certs/cert.pem"))?,
+                      tls::load_private_key_from_file(&Path::new("/home/erebe/progs/wstunnel/certs/key.pem"))?,
+    None)?;
+    let tls_stream = tls_acceptor.accept(ktls::CorkStream::new(stream)).await?;
+    info!("accepted tls");
+    let ktls_stream = ktls::config_ktls_server(tls_stream).await?;
+    info!("done ktls");
+    let (drain, tcp) = ktls_stream.into_raw();
+    if let Some(data) = drain {
+      sock.write_all(&data).await?;
+    };
+
+    let mut ktls_stream = KtlsTcpStream { inner: KtlsStream::new(tcp, None) };
+    //tokio::io::copy_bidirectional(&mut ktls_stream, &mut sock).await;
+
     // Data transfer loop
     let timeout = tokio::time::sleep(upstream.cnx_max_duration);
     select! {
         biased;
 
-        ret = zero_copy_bidirectional(&mut stream, &mut sock) => {
+        ret = zero_copy_bidirectional(&mut ktls_stream, &mut sock) => {
             if let Err(err) = ret {
                warn!("closing cnx {:?}", err);
             }
@@ -366,4 +386,57 @@ async fn extract_sni(stream: &TcpStream) -> anyhow::Result<Option<DnsName>> {
     let sni = snv_names.and_then(|s| s.get_single_hostname());
 
     anyhow::Ok(sni.map(|x| x.to_owned()))
+}
+
+pub struct KtlsTcpStream {
+    pub inner: KtlsStream<TcpStream>
+}
+
+impl AsyncRead for KtlsTcpStream {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let ret = unsafe { Pin::new_unchecked(&mut self.inner) }.poll_read(cx, buf);
+        ret
+    }
+}
+
+impl AsRawFd for KtlsTcpStream {
+    fn as_raw_fd(&self) -> RawFd {
+        self.inner.as_raw_fd()
+    }
+}
+
+impl AsyncWrite for KtlsTcpStream {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> Poll<Result<usize, Error>> {
+       unsafe { Pin::new_unchecked(&mut self.inner) }.poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Error>> {
+        unsafe { Pin::new_unchecked(&mut self.inner) }.poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Error>> {
+        unsafe { Pin::new_unchecked(&mut self.inner) }.poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, bufs: &[IoSlice<'_>]) -> Poll<Result<usize, Error>> {
+        unsafe { Pin::new_unchecked(&mut self.inner) }.poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+}
+
+impl Stream for KtlsTcpStream {
+    fn poll_read_ready_n(&self, cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
+        self.inner.get_ref().poll_read_ready(cx)
+    }
+
+    fn poll_write_ready_n(&self, cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
+        self.inner.get_ref().poll_write_ready(cx)
+    }
+
+    fn try_io_n<R>(&self, interest: Interest, f: impl FnOnce() -> std::io::Result<R>) -> std::io::Result<R> {
+        self.inner.get_ref().try_io(interest, f)
+    }
 }
