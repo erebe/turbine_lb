@@ -7,32 +7,40 @@ use tikv_jemallocator::Jemalloc;
 static GLOBAL: Jemalloc = Jemalloc;
 
 mod peekable_stream;
+mod tls;
 
 use crate::peekable_stream::PeekableStream;
 use anyhow::Context;
 use clap::Parser;
 use duration_str::deserialize_duration;
+use ktls::KtlsStream;
 use nonempty::NonEmpty;
 use rustls::internal::msgs::deframer::MessageDeframer;
 use rustls::internal::msgs::handshake::{ConvertServerNameList, HandshakePayload};
 use rustls::internal::msgs::message::{Message, MessagePayload};
 use rustls::internal::record_layer::RecordLayer;
 use rustls::server::DnsName;
+
 use serde::Deserialize;
 use socket2::{Domain, SockAddr};
 use std::fs::File;
-use std::io::BufReader;
+
+use std::io::{BufReader, Error, IoSlice};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, Interest, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::{pin, select};
-use tokio_splice::zero_copy_bidirectional;
+use tokio_rustls::TlsAcceptor;
+use tokio_splice::{zero_copy_bidirectional, Stream};
 use tracing::{error, field, info, info_span, span, warn, Instrument, Level, Span};
 use tracing_subscriber::EnvFilter;
 
@@ -45,19 +53,19 @@ enum Protocol {
     Tls,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Config {
     pub rules: Vec<Rule>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Rule {
     pub protocol: Protocol,
     pub listen_addr: NonEmpty<SocketAddr>,
     pub upstreams: NonEmpty<Upstream>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Upstream {
     pub name: String,
     pub addrs: NonEmpty<SocketAddr>,
@@ -70,6 +78,18 @@ struct Upstream {
     #[serde(default = "default_connect_timeout")]
     #[serde(deserialize_with = "deserialize_duration")]
     pub connect_timeout: Duration,
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+}
+
+#[derive(Clone, Deserialize)]
+pub struct TlsConfig {
+    pub certificate: PathBuf,
+    pub private_key: PathBuf,
+    #[serde(skip)]
+    pub acceptor: Option<TlsAcceptor>,
+    #[serde(default)]
+    pub alpns: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -111,6 +131,19 @@ async fn main() -> anyhow::Result<()> {
 
     let rules = config.rules.into_iter().flat_map(|mut x| {
         let listen_addr = std::mem::replace(&mut x.listen_addr, NonEmpty::new(LOCAL_ADDR_V4));
+        x.upstreams.iter_mut().for_each(|u| {
+            if let Some(tls) = &mut u.tls {
+                let certs = tls::load_certificates_from_pem(&tls.certificate)
+                    .expect("cannot load certificates");
+                let key = tls::load_private_key_from_file(&tls.private_key)
+                    .expect("cannot load private key");
+                let alpns = tls.alpns.iter().map(|x| x.as_bytes().to_vec()).collect();
+                tls.acceptor = Some(
+                    tls::tls_acceptor(certs, key, Some(alpns)).expect("cannot create TLS acceptor"),
+                );
+            }
+        });
+
         let rule = Arc::new(x);
         listen_addr
             .into_iter()
@@ -312,19 +345,64 @@ async fn handle_client(
         sock.write_all(proxy_protocol_header.as_slice()).await?;
     }
 
-    // Data transfer loop
-    let timeout = tokio::time::sleep(upstream.cnx_max_duration);
-    select! {
-        biased;
-
-        ret = zero_copy_bidirectional(&mut stream, &mut sock) => {
-            if let Err(err) = ret {
-               warn!("closing cnx {:?}", err);
+    // TLS PASSTHROUGH
+    let Some(tls_acceptor) = upstream.tls.as_ref().and_then(|x| x.acceptor.as_ref()) else {
+        // If we're not doing TLS, just copy the data
+        let ret = tokio::time::timeout(
+            upstream.cnx_max_duration,
+            zero_copy_bidirectional(&mut stream, &mut sock),
+        )
+        .await;
+        match ret {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => {
+                warn!("closing cnx {:?}", err);
+            }
+            Err(_) => {
+                warn!(
+                    "timeout of {:?} elapsed. Closing cnx",
+                    upstream.cnx_max_duration
+                );
             }
         }
+        return Ok(());
+    };
 
-        _ = timeout => {
-           warn!("timeout of {:?} elapsed. Closing cnx", upstream.cnx_max_duration);
+    // TLS TERMINATION
+    // Setup KTLS
+    let tls_stream = tls_acceptor.accept(ktls::CorkStream::new(stream)).await?;
+    let ktls_stream = ktls::config_ktls_server(tls_stream).await?;
+    let (drain, tcp) = ktls_stream.into_raw();
+    if let Some(data) = drain {
+        sock.write_all(&data).await?;
+    };
+    let mut ktls_stream = KtlsTcpStream {
+        inner: KtlsStream::new(tcp, None),
+    };
+
+    // Data transfer loop
+    let timeout = tokio::time::sleep(upstream.cnx_max_duration);
+    pin!(timeout);
+    loop {
+        select! {
+            biased;
+
+            ret = zero_copy_bidirectional(&mut ktls_stream, &mut sock) => {
+                if let Err(err) = ret {
+                   // if err.kind() == InvalidInput {
+                   //         ktls_stream.inner.handle_msg();
+                   //     warn!("error while copying data: {:?}", err);
+                   //     continue;
+                   // }
+                   warn!("closing cnx {:?}", err);
+                        break;
+                }
+            }
+
+            _ = &mut timeout => {
+               warn!("timeout of {:?} elapsed. Closing cnx", upstream.cnx_max_duration);
+                    break;
+            }
         }
     }
 
@@ -366,4 +444,78 @@ async fn extract_sni(stream: &TcpStream) -> anyhow::Result<Option<DnsName>> {
     let sni = snv_names.and_then(|s| s.get_single_hostname());
 
     anyhow::Ok(sni.map(|x| x.to_owned()))
+}
+
+pub struct KtlsTcpStream {
+    pub inner: KtlsStream<TcpStream>,
+}
+
+impl AsyncRead for KtlsTcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        unsafe { Pin::new_unchecked(&mut self.inner) }.poll_read(cx, buf)
+    }
+}
+
+impl AsRawFd for KtlsTcpStream {
+    fn as_raw_fd(&self) -> RawFd {
+        self.inner.as_raw_fd()
+    }
+}
+
+impl AsyncWrite for KtlsTcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, Error>> {
+        unsafe { Pin::new_unchecked(&mut self.inner) }.poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), Error>> {
+        unsafe { Pin::new_unchecked(&mut self.inner) }.poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), Error>> {
+        unsafe { Pin::new_unchecked(&mut self.inner) }.poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<Result<usize, Error>> {
+        unsafe { Pin::new_unchecked(&mut self.inner) }.poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+}
+
+impl Stream for KtlsTcpStream {
+    fn poll_read_ready_n(&self, cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
+        self.inner.poll_read_ready(cx)
+    }
+
+    fn poll_write_ready_n(&self, cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
+        self.inner.poll_write_ready(cx)
+    }
+
+    fn try_io_n<R>(
+        &self,
+        interest: Interest,
+        f: impl FnOnce() -> std::io::Result<R>,
+    ) -> std::io::Result<R> {
+        self.inner.try_io(interest, f)
+    }
 }
