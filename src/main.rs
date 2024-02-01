@@ -293,6 +293,24 @@ async fn handle_client(
                     )
                 })??;
 
+            //       EINPROGRESS
+            //               The socket is nonblocking and the connection cannot be
+            //               completed immediately.  (UNIX domain sockets failed with
+            //               EAGAIN instead.)  It is possible to select(2) or poll(2)
+            //               for completion by selecting the socket for writing.  After
+            //               select(2) indicates writability, use getsockopt(2) to read
+            //               the SO_ERROR option at level SOL_SOCKET to determine
+            //               whether connect() completed successfully (SO_ERROR is
+            //               zero) or unsuccessfully (SO_ERROR is one of the usual
+            //               error codes listed here, explaining the reason for the
+            //               failure).
+            if let Some(err) = sock.take_error()? {
+                return Err(anyhow::Error::msg(format!(
+                    "Error while connecting to remote: {:?}",
+                    err
+                )));
+            }
+
             Ok(sock)
         }
         Err(err) => Err(err),
