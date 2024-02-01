@@ -6,22 +6,23 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
+mod config;
+mod load_balancing_strategy;
+mod r#match;
 mod peekable_stream;
 mod tls;
 
 use crate::peekable_stream::PeekableStream;
 use anyhow::Context;
 use clap::Parser;
-use duration_str::deserialize_duration;
 use ktls::KtlsStream;
 use nonempty::NonEmpty;
 use rustls::internal::msgs::deframer::MessageDeframer;
-use rustls::internal::msgs::handshake::{ConvertServerNameList, HandshakePayload};
+use rustls::internal::msgs::handshake::{ConvertServerNameList, HandshakePayload, ProtocolName};
 use rustls::internal::msgs::message::{Message, MessagePayload};
 use rustls::internal::record_layer::RecordLayer;
 use rustls::server::DnsName;
 
-use serde::Deserialize;
 use socket2::{Domain, SockAddr};
 use std::fs::File;
 
@@ -35,72 +36,31 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
+use crate::config::{BackendDiscovery, Config, Protocol, UpstreamConfig};
+use crate::load_balancing_strategy::{Backend, LoadBalancingStrategy};
+use crate::r#match::MatchContext;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, Interest, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::{pin, select};
 use tokio_rustls::TlsAcceptor;
 use tokio_splice::{zero_copy_bidirectional, Stream};
-use tracing::{error, field, info, info_span, span, warn, Instrument, Level, Span};
+use tracing::{debug, error, field, info, info_span, span, warn, Instrument, Level, Span};
 use tracing_subscriber::EnvFilter;
 
 const LOCAL_ADDR_V6: SocketAddr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0));
 const LOCAL_ADDR_V4: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-enum Protocol {
-    Tcp,
-    Tls,
-}
-
-#[derive(Clone, Deserialize)]
-struct Config {
-    pub rules: Vec<Rule>,
-}
-
-#[derive(Clone, Deserialize)]
 struct Rule {
     pub protocol: Protocol,
-    pub listen_addr: NonEmpty<SocketAddr>,
     pub upstreams: NonEmpty<Upstream>,
 }
 
-#[derive(Clone, Deserialize)]
 struct Upstream {
-    pub name: String,
-    pub addrs: NonEmpty<SocketAddr>,
-    #[serde(skip)]
-    pub round_robin_counter: Arc<AtomicUsize>,
-    pub proxy_protocol: bool,
-    pub r#match: Match,
-    #[serde(deserialize_with = "deserialize_duration")]
-    pub cnx_max_duration: Duration,
-    #[serde(default = "default_connect_timeout")]
-    #[serde(deserialize_with = "deserialize_duration")]
-    pub connect_timeout: Duration,
-    #[serde(default)]
-    pub tls: Option<TlsConfig>,
-}
-
-#[derive(Clone, Deserialize)]
-pub struct TlsConfig {
-    pub certificate: PathBuf,
-    pub private_key: PathBuf,
-    #[serde(skip)]
-    pub acceptor: Option<TlsAcceptor>,
-    #[serde(default)]
-    pub alpns: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub enum Match {
-    Any,
-    Sni(String),
-    DestinationPort(u16),
-}
-
-fn default_connect_timeout() -> Duration {
-    Duration::from_secs(10)
+    pub cfg: UpstreamConfig,
+    pub backends: NonEmpty<Backend>,
+    pub load_balancing: LoadBalancingStrategy,
+    pub tls_acceptor: Option<TlsAcceptor>,
 }
 
 /// Tcp Proxy
@@ -131,20 +91,37 @@ async fn main() -> anyhow::Result<()> {
 
     let rules = config.rules.into_iter().flat_map(|mut x| {
         let listen_addr = std::mem::replace(&mut x.listen_addr, NonEmpty::new(LOCAL_ADDR_V4));
-        x.upstreams.iter_mut().for_each(|u| {
-            if let Some(tls) = &mut u.tls {
+        let ups = x.upstreams.into_iter().map(|u| {
+            let tls_acceptor = if let Some(tls) = &u.tls {
                 let certs = tls::load_certificates_from_pem(&tls.certificate)
                     .expect("cannot load certificates");
                 let key = tls::load_private_key_from_file(&tls.private_key)
                     .expect("cannot load private key");
                 let alpns = tls.alpns.iter().map(|x| x.as_bytes().to_vec()).collect();
-                tls.acceptor = Some(
+                Some(
                     tls::tls_acceptor(certs, key, Some(alpns)).expect("cannot create TLS acceptor"),
-                );
+                )
+            } else {
+                None
+            };
+            let backends: Vec<Backend> = match &u.backends {
+                BackendDiscovery::Static(x) => {
+                    x.into_iter().map(|x| Backend::new(x.addr)).collect()
+                }
+            };
+
+            Upstream {
+                backends: NonEmpty::from_vec(backends).expect("at least one backend"),
+                load_balancing: LoadBalancingStrategy::from(&u.load_balancing),
+                tls_acceptor,
+                cfg: u,
             }
         });
 
-        let rule = Arc::new(x);
+        let rule = Arc::new(Rule {
+            protocol: x.protocol,
+            upstreams: NonEmpty::from_vec(ups.collect()).expect("at least one upstream"),
+        });
         listen_addr
             .into_iter()
             .map(move |addr| (addr, rule.clone()))
@@ -264,68 +241,55 @@ async fn handle_client(
         info!("connections closed");
     });
 
-    let cnx_sni = match local.protocol {
-        Protocol::Tls => match extract_sni(&stream).await? {
-            Some(sni) => {
-                info!("SNI: {}", sni.as_ref());
-                Some(sni)
-            }
-            None => None,
-        },
-        Protocol::Tcp => None,
+    let match_context = match local.protocol {
+        Protocol::Tls => {
+            let (sni, alpns) = extract_tls_info(&stream).await?;
+            debug!("SNI: {:?}", sni.as_ref().map(|x| x.as_ref()).unwrap_or(""));
+            MatchContext::new(&stream, sni, alpns)
+        }
+        Protocol::Tcp => MatchContext::new(&stream, None, None),
     };
 
     // Select the correct upstream based on matches
-    let upstream = local
-        .upstreams
-        .iter()
-        .find(|upstream| match &upstream.r#match {
-            Match::Any => true,
-            Match::Sni(sni) => cnx_sni
-                .as_ref()
-                .map(|cnx_sni| cnx_sni.as_ref() == sni.as_str())
-                .unwrap_or(false),
-            Match::DestinationPort(dport) => stream.local_addr().unwrap().port() == *dport,
-        })
-        .unwrap_or_else(|| {
-            warn!("No upstream found, defaulting to first one. Add an Match::Any rule to avoid this message");
-            local.upstreams.first()
-        });
-
-    // Round-robin the upstreams
-    let upstream_addr = {
-        let ix = upstream.round_robin_counter.fetch_add(1, Ordering::Relaxed);
-        &upstream.addrs[ix % upstream.addrs.len()]
+    let Some(upstream) = match_context.find_matching_upstream(&local.upstreams) else {
+        warn!(
+            "Dropping connection: No upstream found for {:?}",
+            match_context
+        );
+        return Ok(());
     };
 
+    // Round-robin the upstreams
+    let backend = upstream.load_balancing.pick_backend(&upstream.backends);
+
     let span = Span::current();
-    span.record("upstream", upstream.name.as_str());
-    span.record("upstream_addr", upstream_addr.to_string());
-    span.record("proxy", upstream.proxy_protocol);
+    span.record("upstream", upstream.cfg.name.as_str());
+    span.record("upstream_addr", backend.addr.to_string());
+    span.record("proxy", upstream.cfg.proxy_protocol);
     span.record(
         "timeout",
-        format!("{}m", max(upstream.cnx_max_duration.as_secs(), 1) / 60),
+        format!("{}m", max(upstream.cfg.cnx_max_duration.as_secs(), 1) / 60),
     );
 
     info!("connecting to upstream");
-    let sock = if upstream_addr.is_ipv4() {
+    let sock = if backend.addr.is_ipv4() {
         create_socket(LOCAL_ADDR_V4)?
     } else {
         create_socket(LOCAL_ADDR_V6)?
     };
 
-    let mut sock = match sock.connect(&SockAddr::from(*upstream_addr)) {
+    let mut sock = match sock.connect(&SockAddr::from(backend.addr)) {
         Ok(_) => TcpStream::from_std(std::net::TcpStream::from(sock)),
 
         // wait for the socket to be connected if not already
         Err(err) if matches!(err.raw_os_error(), Some(nix::libc::EINPROGRESS)) => {
             let sock = TcpStream::from_std(std::net::TcpStream::from(sock))?;
-            tokio::time::timeout(upstream.connect_timeout, sock.writable())
+            tokio::time::timeout(upstream.cfg.connect_timeout, sock.writable())
                 .await
                 .with_context(|| {
                     format!(
                         "Cannot connect to remote after {:?}",
-                        upstream.connect_timeout
+                        upstream.cfg.connect_timeout
                     )
                 })??;
 
@@ -335,7 +299,7 @@ async fn handle_client(
     }?;
 
     // Send proxy protocol header
-    if upstream.proxy_protocol {
+    if upstream.cfg.proxy_protocol {
         let proxy_protocol_header = ppp::v2::Builder::with_addresses(
             ppp::v2::Version::Two | ppp::v2::Command::Proxy,
             ppp::v2::Protocol::Stream,
@@ -346,10 +310,10 @@ async fn handle_client(
     }
 
     // TLS PASSTHROUGH
-    let Some(tls_acceptor) = upstream.tls.as_ref().and_then(|x| x.acceptor.as_ref()) else {
+    let Some(tls_acceptor) = &upstream.tls_acceptor else {
         // If we're not doing TLS, just copy the data
         let ret = tokio::time::timeout(
-            upstream.cnx_max_duration,
+            upstream.cfg.cnx_max_duration,
             zero_copy_bidirectional(&mut stream, &mut sock),
         )
         .await;
@@ -361,7 +325,7 @@ async fn handle_client(
             Err(_) => {
                 warn!(
                     "timeout of {:?} elapsed. Closing cnx",
-                    upstream.cnx_max_duration
+                    upstream.cfg.cnx_max_duration
                 );
             }
         }
@@ -381,7 +345,7 @@ async fn handle_client(
     };
 
     // Data transfer loop
-    let timeout = tokio::time::sleep(upstream.cnx_max_duration);
+    let timeout = tokio::time::sleep(upstream.cfg.cnx_max_duration);
     pin!(timeout);
     loop {
         select! {
@@ -400,7 +364,7 @@ async fn handle_client(
             }
 
             _ = &mut timeout => {
-               warn!("timeout of {:?} elapsed. Closing cnx", upstream.cnx_max_duration);
+               warn!("timeout of {:?} elapsed. Closing cnx", upstream.cfg.cnx_max_duration);
                     break;
             }
         }
@@ -409,7 +373,9 @@ async fn handle_client(
     Ok(())
 }
 
-async fn extract_sni(stream: &TcpStream) -> anyhow::Result<Option<DnsName>> {
+async fn extract_tls_info(
+    stream: &TcpStream,
+) -> anyhow::Result<(Option<DnsName>, Option<Vec<ProtocolName>>)> {
     let mut tls_deframer = MessageDeframer::default();
     let mut record_layer = RecordLayer::new();
     let mut peek_stream = PeekableStream::new(stream);
@@ -420,11 +386,10 @@ async fn extract_sni(stream: &TcpStream) -> anyhow::Result<Option<DnsName>> {
         .pop(&mut record_layer)?
         .with_context(|| "No TLS frame read")?;
     let msg = Message::try_from(msg.message)?;
-    let snv_names = match &msg.payload {
+    let (snv_names, alpns) = match &msg.payload {
         MessagePayload::Handshake { parsed, .. } => match &parsed.payload {
             HandshakePayload::ClientHello(msg) => {
-                let srv_names = msg.get_sni_extension();
-                srv_names
+                (msg.get_sni_extension(), msg.get_alpn_extension())
             }
             msg => {
                 return Err(anyhow::Error::msg(format!(
@@ -443,7 +408,7 @@ async fn extract_sni(stream: &TcpStream) -> anyhow::Result<Option<DnsName>> {
 
     let sni = snv_names.and_then(|s| s.get_single_hostname());
 
-    anyhow::Ok(sni.map(|x| x.to_owned()))
+    anyhow::Ok((sni.map(|x| x.to_owned()), alpns.map(|x| x.to_owned())))
 }
 
 pub struct KtlsTcpStream {
