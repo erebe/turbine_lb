@@ -24,35 +24,50 @@ pub fn parse_config(config_path: &Path) -> anyhow::Result<HashMap<SocketAddr, Ar
         .into_iter()
         .flat_map(|mut x| {
             let listen_addr = std::mem::replace(&mut x.listen_addr, NonEmpty::new(LOCAL_ADDR_V4));
-            let ups = x.upstreams.into_iter().flat_map(|u| -> anyhow::Result<Upstream> {
-                let tls_acceptor = if let Some(tls) = &u.tls {
-                    let certs = tls::load_certificates_from_pem(&tls.certificate)
-                        .with_context(|| format!("cannot create cert from file {}", tls.certificate.display()))?;
-                    let key = tls::load_private_key_from_file(&tls.private_key)
-                        .with_context(|| format!("cannot create private key from file {}", tls.private_key.display()))?;
-                    let alpns = tls.alpns.iter().map(|x| x.as_bytes().to_vec()).collect();
-                    let tls_acceptor = tls::tls_acceptor(certs, key, Some(alpns))
-                            .with_context(|| "cannot create tls acceptor")?;
+            let ups =
+                x.upstreams
+                    .into_iter()
+                    .flat_map(|u| -> anyhow::Result<Upstream> {
+                        let tls_acceptor = if let Some(tls) = &u.tls {
+                            let certs = tls::load_certificates_from_pem(&tls.certificate)
+                                .with_context(|| {
+                                    format!(
+                                        "cannot create cert from file {}",
+                                        tls.certificate.display()
+                                    )
+                                })?;
+                            let key = tls::load_private_key_from_file(&tls.private_key)
+                                .with_context(|| {
+                                    format!(
+                                        "cannot create private key from file {}",
+                                        tls.private_key.display()
+                                    )
+                                })?;
+                            let alpns = tls.alpns.iter().map(|x| x.as_bytes().to_vec()).collect();
+                            let tls_acceptor = tls::tls_acceptor(certs, key, Some(alpns))
+                                .with_context(|| "cannot create tls acceptor")?;
 
-                    Some(tls_acceptor)
-                } else {
-                    None
-                };
+                            Some(tls_acceptor)
+                        } else {
+                            None
+                        };
 
-                let backends: NonEmpty<Backend> = match &u.backends {
-                    BackendDiscovery::Static(bs) => {
-                        NonEmpty::collect(bs.into_iter().map(|x| Backend::new(x.addr)))
-                            .with_context(||  format!("Empty backend list for upstream {}", u.name))?
-                    }
-                };
+                        let backends: NonEmpty<Backend> = match &u.backends {
+                            BackendDiscovery::Static(bs) => {
+                                NonEmpty::collect(bs.into_iter().map(|x| Backend::new(x.addr)))
+                                    .with_context(|| {
+                                        format!("Empty backend list for upstream {}", u.name)
+                                    })?
+                            }
+                        };
 
-                Ok(Upstream {
-                    backends,
-                    load_balancing: LoadBalancingStrategy::from(&u.load_balancing),
-                    tls_acceptor,
-                    cfg: u,
-                })
-            });
+                        Ok(Upstream {
+                            backends,
+                            load_balancing: LoadBalancingStrategy::from(&u.load_balancing),
+                            tls_acceptor,
+                            cfg: u,
+                        })
+                    });
 
             let rule = Arc::new(Rule {
                 protocol: x.protocol,

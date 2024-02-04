@@ -5,7 +5,7 @@ use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug};
+use tracing::debug;
 use tracing::log::warn;
 
 pub fn load_certificates_from_pem(path: &Path) -> anyhow::Result<Vec<Certificate>> {
@@ -45,7 +45,7 @@ pub fn tls_acceptor(
     private_key: PrivateKey,
     alpn_protocols: Option<Vec<Vec<u8>>>,
 ) -> anyhow::Result<TlsAcceptor> {
-    let mut config = tokio_rustls::rustls::ServerConfig::builder()
+    let mut config = rustls::ServerConfig::builder()
         .with_safe_defaults()
         .with_no_client_auth()
         .with_single_cert(certificate, private_key)

@@ -115,7 +115,6 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let rules = config::parse_config(&cmd_line.config)?;
-
     let (config_tx, config_rx) = mpsc::channel(10);
     let (shutdown_tx, mut lb_context) = LBAppContext::new();
     tokio::spawn(async move {
