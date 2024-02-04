@@ -1,4 +1,4 @@
-use crate::config::LoadBalancingStrategyConfig;
+use crate::config::types::LoadBalancingStrategyConfig;
 use nonempty::NonEmpty;
 use serde::Deserialize;
 use std::net::SocketAddr;

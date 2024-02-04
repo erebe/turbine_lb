@@ -7,10 +7,12 @@ use tikv_jemallocator::Jemalloc;
 static GLOBAL: Jemalloc = Jemalloc;
 
 mod config;
+mod event_loop;
 mod load_balancing_strategy;
 mod r#match;
 mod peekable_stream;
 mod tls;
+mod tls_reloader;
 
 use crate::peekable_stream::PeekableStream;
 use anyhow::Context;
@@ -24,28 +26,28 @@ use rustls::internal::record_layer::RecordLayer;
 use rustls::server::DnsName;
 
 use socket2::{Domain, SockAddr};
-use std::fs::File;
-
-use std::io::{BufReader, Error, IoSlice};
+use std::io::{Error, IoSlice};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::{AsRawFd, RawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
-use crate::config::{BackendDiscovery, Config, Protocol, UpstreamConfig};
+use crate::config::types::{Protocol, UpstreamConfig};
+use crate::config::ConfigWatcher;
+use crate::event_loop::LBAppContext;
 use crate::load_balancing_strategy::{Backend, LoadBalancingStrategy};
 use crate::r#match::MatchContext;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, Interest, ReadBuf};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::mpsc;
 use tokio::{pin, select};
 use tokio_rustls::TlsAcceptor;
 use tokio_splice::{zero_copy_bidirectional, Stream};
-use tracing::{debug, error, field, info, info_span, span, warn, Instrument, Level, Span};
+use tracing::{debug, info, warn, Span};
 use tracing_subscriber::EnvFilter;
 
 const LOCAL_ADDR_V6: SocketAddr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0));
@@ -54,6 +56,20 @@ const LOCAL_ADDR_V4: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNS
 struct Rule {
     pub protocol: Protocol,
     pub upstreams: NonEmpty<Upstream>,
+}
+
+impl Rule {
+    pub fn files_to_watch_for_reload(&self) -> impl Iterator<Item = &Path> {
+        self.upstreams
+            .iter()
+            .filter_map(|u| {
+                u.cfg
+                    .tls
+                    .as_ref()
+                    .map(|t| [t.private_key.as_path(), t.certificate.as_path()])
+            })
+            .flatten()
+    }
 }
 
 struct Upstream {
@@ -70,6 +86,18 @@ struct CmdLine {
     /// Path to the config file
     #[arg(short = 'c', long, default_value = "config.yaml")]
     config: PathBuf,
+
+    /// Control the log verbosity. i.e: TRACE, DEBUG, INFO, WARN, ERROR, OFF
+    /// for more details: https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html#example-syntax
+    #[arg(
+        long,
+        global = true,
+        value_name = "LOG_LEVEL",
+        verbatim_doc_comment,
+        env = "RUST_LOG",
+        default_value = "INFO"
+    )]
+    log_lvl: String,
 }
 
 static TASK_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -82,115 +110,21 @@ async fn main() -> anyhow::Result<()> {
         .with_ansi(true)
         .with_env_filter(
             EnvFilter::builder()
-                .with_default_directive(Level::INFO.into())
-                .from_env_lossy(),
+                .parse(&cmd_line.log_lvl)
+                .expect("Invalid log filter"),
         )
         .init();
 
-    let config: Config = serde_yaml::from_reader(BufReader::new(File::open(cmd_line.config)?))?;
+    let rules = config::parse_config(&cmd_line.config)?;
 
-    let rules = config.rules.into_iter().flat_map(|mut x| {
-        let listen_addr = std::mem::replace(&mut x.listen_addr, NonEmpty::new(LOCAL_ADDR_V4));
-        let ups = x.upstreams.into_iter().map(|u| {
-            let tls_acceptor = if let Some(tls) = &u.tls {
-                let certs = tls::load_certificates_from_pem(&tls.certificate)
-                    .expect("cannot load certificates");
-                let key = tls::load_private_key_from_file(&tls.private_key)
-                    .expect("cannot load private key");
-                let alpns = tls.alpns.iter().map(|x| x.as_bytes().to_vec()).collect();
-                Some(
-                    tls::tls_acceptor(certs, key, Some(alpns)).expect("cannot create TLS acceptor"),
-                )
-            } else {
-                None
-            };
-            let backends: Vec<Backend> = match &u.backends {
-                BackendDiscovery::Static(x) => {
-                    x.into_iter().map(|x| Backend::new(x.addr)).collect()
-                }
-            };
-
-            Upstream {
-                backends: NonEmpty::from_vec(backends).expect("at least one backend"),
-                load_balancing: LoadBalancingStrategy::from(&u.load_balancing),
-                tls_acceptor,
-                cfg: u,
-            }
-        });
-
-        let rule = Arc::new(Rule {
-            protocol: x.protocol,
-            upstreams: NonEmpty::from_vec(ups.collect()).expect("at least one upstream"),
-        });
-        listen_addr
-            .into_iter()
-            .map(move |addr| (addr, rule.clone()))
+    let (config_tx, config_rx) = mpsc::channel(10);
+    let (shutdown_tx, mut lb_context) = LBAppContext::new();
+    tokio::spawn(async move {
+        lb_context.listen_config_change(config_rx).await;
     });
-
-    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
-
-    for (listen_addr, rule) in rules {
-        let tcp_server = create_socket(listen_addr)?;
-        tcp_server.listen(4096)?;
-        let tcp_server = TcpListener::from_std(std::net::TcpListener::from(tcp_server))?;
-        let mut shutdown_rx = shutdown_tx.subscribe();
-
-        let server_span = info_span!("lb", listen_addr = %listen_addr, protocol = ?rule.protocol);
-        let server_loop = async move {
-            info!("starting");
-            let _guard = scopeguard::guard((), |_| {
-                info!("stopped");
-            });
-            let shutdown_signal = shutdown_rx.recv();
-            pin!(shutdown_signal);
-
-            loop {
-                let (stream, peer_addr) = select! {
-                    biased;
-                    _ = &mut shutdown_signal => {
-                        warn!("Receive signal to shutdown");
-                        break;
-                    }
-
-                    ret = tcp_server.accept() => match ret {
-                        Ok(cnx) => cnx,
-                        Err(err) => {
-                            error!("error accepting new connections: {:?}", err);
-                            continue;
-                        }
-                    }
-                };
-
-                let span = span!(
-                    //parent: Span::none(),
-                    Level::INFO,
-                    "cnx",
-                    peer = %peer_addr,
-                    upstream = field::Empty,
-                    upstream_addr = field::Empty,
-                    proxy = field::Empty,
-                    timeout = field::Empty);
-
-                let rule = rule.clone();
-                let proxied_client_loop = async move {
-                    TASK_COUNTER.fetch_add(1, Ordering::Relaxed);
-                    let _guard = scopeguard::guard((), |_| {
-                        TASK_COUNTER.fetch_sub(1, Ordering::Relaxed);
-                    });
-
-                    if let Err(err) = handle_client(&rule, stream, peer_addr).await {
-                        warn!("{:?}", err);
-                    }
-                }
-                .instrument(span);
-
-                tokio::spawn(proxied_client_loop);
-            }
-        }
-        .instrument(server_span);
-
-        tokio::spawn(server_loop);
-    }
+    let _ = config_tx.send(rules).await;
+    let _config_watch = ConfigWatcher::new(cmd_line.config.clone(), config_tx)
+        .expect("Cannot watch for config file changes");
 
     let mut sigterm = signal(SignalKind::terminate()).unwrap();
     let mut sigint = signal(SignalKind::interrupt()).unwrap();

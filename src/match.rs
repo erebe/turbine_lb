@@ -1,4 +1,4 @@
-use crate::config::MatchConfig;
+use crate::config::types::MatchConfig;
 use crate::Upstream;
 use nonempty::NonEmpty;
 use rustls::internal::msgs::handshake::{ConvertProtocolNameList, ProtocolName};

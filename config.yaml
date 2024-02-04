@@ -62,7 +62,7 @@ rules:
       load_balancing: !RoundRobin
 
 - listen_addr:
-    - "[::]:8089"
+  - "[::]:8091"
   protocol: Tls
   upstreams:
     - name: nginx-https
