@@ -12,7 +12,6 @@ mod load_balancing_strategy;
 mod r#match;
 mod peekable_stream;
 mod tls;
-mod tls_reloader;
 
 use crate::peekable_stream::PeekableStream;
 use anyhow::Context;

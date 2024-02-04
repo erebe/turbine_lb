@@ -17,7 +17,6 @@ use tracing::{debug, error, info};
 
 pub mod types;
 
-// FIXME: Remove expect
 pub fn parse_config(config_path: &Path) -> anyhow::Result<HashMap<SocketAddr, Arc<Rule>>> {
     let config: Config = serde_yaml::from_reader(BufReader::new(File::open(config_path)?))?;
     let rules: HashMap<SocketAddr, Arc<Rule>> = config
@@ -25,37 +24,39 @@ pub fn parse_config(config_path: &Path) -> anyhow::Result<HashMap<SocketAddr, Ar
         .into_iter()
         .flat_map(|mut x| {
             let listen_addr = std::mem::replace(&mut x.listen_addr, NonEmpty::new(LOCAL_ADDR_V4));
-            let ups = x.upstreams.into_iter().map(|u| {
+            let ups = x.upstreams.into_iter().flat_map(|u| -> anyhow::Result<Upstream> {
                 let tls_acceptor = if let Some(tls) = &u.tls {
                     let certs = tls::load_certificates_from_pem(&tls.certificate)
-                        .expect("cannot load certificates");
+                        .with_context(|| format!("cannot create cert from file {}", tls.certificate.display()))?;
                     let key = tls::load_private_key_from_file(&tls.private_key)
-                        .expect("cannot load private key");
+                        .with_context(|| format!("cannot create private key from file {}", tls.private_key.display()))?;
                     let alpns = tls.alpns.iter().map(|x| x.as_bytes().to_vec()).collect();
-                    Some(
-                        tls::tls_acceptor(certs, key, Some(alpns))
-                            .expect("cannot create TLS acceptor"),
-                    )
+                    let tls_acceptor = tls::tls_acceptor(certs, key, Some(alpns))
+                            .with_context(|| "cannot create tls acceptor")?;
+
+                    Some(tls_acceptor)
                 } else {
                     None
                 };
-                let backends: Vec<Backend> = match &u.backends {
-                    BackendDiscovery::Static(x) => {
-                        x.into_iter().map(|x| Backend::new(x.addr)).collect()
+
+                let backends: NonEmpty<Backend> = match &u.backends {
+                    BackendDiscovery::Static(bs) => {
+                        NonEmpty::collect(bs.into_iter().map(|x| Backend::new(x.addr)))
+                            .with_context(||  format!("Empty backend list for upstream {}", u.name))?
                     }
                 };
 
-                Upstream {
-                    backends: NonEmpty::from_vec(backends).expect("at least one backend"),
+                Ok(Upstream {
+                    backends,
                     load_balancing: LoadBalancingStrategy::from(&u.load_balancing),
                     tls_acceptor,
                     cfg: u,
-                }
+                })
             });
 
             let rule = Arc::new(Rule {
                 protocol: x.protocol,
-                upstreams: NonEmpty::from_vec(ups.collect()).expect("at least one upstream"),
+                upstreams: NonEmpty::collect(ups).expect("Empty upstreams list"),
             });
 
             listen_addr

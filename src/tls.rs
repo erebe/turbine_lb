@@ -5,11 +5,11 @@ use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;
-use tracing::info;
+use tracing::{debug};
 use tracing::log::warn;
 
 pub fn load_certificates_from_pem(path: &Path) -> anyhow::Result<Vec<Certificate>> {
-    info!("Loading tls certificate from {:?}", path);
+    debug!("Loading tls certificate from {:?}", path);
 
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
@@ -28,7 +28,7 @@ pub fn load_certificates_from_pem(path: &Path) -> anyhow::Result<Vec<Certificate
 }
 
 pub fn load_private_key_from_file(path: &Path) -> anyhow::Result<PrivateKey> {
-    info!("Loading tls private key from {:?}", path);
+    debug!("Loading tls private key from {:?}", path);
 
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
