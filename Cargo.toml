@@ -29,3 +29,10 @@ parking_lot = "0.12.1"
 tracing = { version = "0.1.40", features = ["log"] }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "fmt", "local-time"] }
 tikv-jemallocator = "0.5"
+
+[profile.release]
+lto = "fat"
+#panic = "abort"
+codegen-units = 1
+opt-level = 3
+debug = 1
