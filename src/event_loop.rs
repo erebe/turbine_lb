@@ -1,8 +1,10 @@
 use crate::{create_socket, handle_client, Rule};
+use futures::task::noop_waker_ref;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use tokio::net::TcpListener;
 use tokio::select;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -118,8 +120,18 @@ impl LBRunner {
                             continue;
                         }
                         Err(_) => {
-                            warn!("Asked to shutdown");
-                            break;
+                            warn!("Asked to shutdown, draining accept queue. Ensure no traffic is send to the LB");
+                            let mut cx = Context::from_waker(noop_waker_ref());
+                            match tcp_server.poll_accept(&mut cx) {
+                                Poll::Ready(ret) => match ret {
+                                    Ok(cnx) => cnx,
+                                    Err(err) => {
+                                        error!("error accepting new connections: {:?}", err);
+                                        break
+                                    },
+                                }
+                                Poll::Pending => break,
+                            }
                         }
                     }
                 }

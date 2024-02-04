@@ -30,7 +30,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::task::Poll;
 use std::time::Duration;
 
@@ -99,8 +99,6 @@ struct CmdLine {
     log_lvl: String,
 }
 
-static TASK_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cmd_line: CmdLine = CmdLine::parse();
@@ -117,6 +115,7 @@ async fn main() -> anyhow::Result<()> {
     let rules = config::parse_config(&cmd_line.config)?;
     let (config_tx, config_rx) = mpsc::channel(10);
     let (shutdown_tx, mut lb_context) = LBAppContext::new();
+    let task_counter = lb_context.tasks_running.clone();
     tokio::spawn(async move {
         lb_context.listen_config_change(config_rx).await;
     });
@@ -127,14 +126,17 @@ async fn main() -> anyhow::Result<()> {
     let mut sigterm = signal(SignalKind::terminate()).unwrap();
     let mut sigint = signal(SignalKind::interrupt()).unwrap();
     select! {
-        _ = sigterm.recv() => println!("Receive SIGTERM"),
-        _ = sigint.recv() => println!("Receive SIGTINT"),
+        _ = sigterm.recv() => info!("Receive SIGTERM"),
+        _ = sigint.recv() => info!("Receive SIGTINT"),
     }
+
+    // Kube takes a bit of time to clean up everything. So LB can still receive new cnx during 10/15secs
+    let _ = tokio::time::sleep(Duration::from_secs(15)).await;
     let _ = shutdown_tx.send(());
 
     // Wait to drain all the connections
     loop {
-        let nb_task = TASK_COUNTER.load(Ordering::Relaxed);
+        let nb_task = task_counter.load(Ordering::Relaxed);
         if nb_task == 0 {
             break;
         }
