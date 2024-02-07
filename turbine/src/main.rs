@@ -11,6 +11,7 @@ mod event_loop;
 mod load_balancing_strategy;
 mod r#match;
 mod peekable_stream;
+mod splice_strategy;
 mod tls;
 
 use crate::peekable_stream::PeekableStream;
@@ -112,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    splice_strategy::ebpf_sockmap::init();
     let rules = config::parse_config(&cmd_line.config)?;
     let (config_tx, config_rx) = mpsc::channel(10);
     let (shutdown_tx, mut lb_context) = LBAppContext::new();

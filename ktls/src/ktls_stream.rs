@@ -416,13 +416,11 @@ impl KtlsStream<tokio::net::TcpStream> {
                         // the file descriptor will be closed when the stream is dropped,
                         // we already protect against writes-after-close_notify through
                         // the write_closed flag
-                        return;
                     }
                     _ => {
                         // we got something we probably can't handle
                     }
                 }
-                return;
             }
             TlsRecordType::Handshake => {
                 // TODO: this is where we receive TLS 1.3 resumption tickets,
@@ -437,7 +435,7 @@ impl KtlsStream<tokio::net::TcpStream> {
                 // just ignore the record?
                 tracing::trace!("received record_type {t:#?}");
             }
-        };
+        }
     }
 
     pub fn poll_read_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
