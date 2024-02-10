@@ -25,7 +25,6 @@ use rustls::internal::msgs::message::{Message, MessagePayload};
 use rustls::internal::record_layer::RecordLayer;
 use rustls::server::DnsName;
 
-
 use socket2::{Domain, SockAddr, SockRef, TcpKeepalive};
 use std::io::{Error, IoSlice};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -131,15 +130,21 @@ async fn main() -> anyhow::Result<()> {
     let mut sigterm = signal(SignalKind::terminate()).unwrap();
     let mut sigint = signal(SignalKind::interrupt()).unwrap();
     select! {
-        _ = sigterm.recv() => info!("Receive SIGTERM"),
-        _ = sigint.recv() => info!("Receive SIGTINT"),
+        biased;
+        _ = sigterm.recv() => info!("Receive SIGTERM. Waiting 15 to receive in-flight connection"),
+        _ = sigint.recv() => info!("Receive SIGTINT. Waiting 15 to receive in-flight connection"),
     }
 
     // Kube takes a bit of time to clean up everything. So LB can still receive new cnx during 10/15secs
-    let _ = tokio::time::sleep(Duration::from_secs(15)).await;
+    select! {
+        _ = tokio::time::sleep(Duration::from_secs(15)) => {}
+        _ = sigint.recv() => info!("Received double SIGTINT. Sending stop immediately"),
+    }
     let _ = shutdown_tx.send(());
 
     // Wait to drain all the connections
+    let sigint = sigint.recv();
+    pin!(sigint);
     loop {
         let nb_task = task_counter.load(Ordering::Relaxed);
         if nb_task == 0 {
@@ -147,19 +152,26 @@ async fn main() -> anyhow::Result<()> {
         }
 
         info!("Waiting for {} cnx to shutdown", nb_task);
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        select! {
+            biased;
+
+            _ = &mut sigint => break,
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                info!("Received triple SIGINT. Exiting immediatly")
+            }
+        }
     }
 
     Ok(())
 }
 
 fn tcp_keep_alive_cfg() -> &'static TcpKeepalive {
-    static keep_alive: TcpKeepalive = TcpKeepalive::new()
+    static KEEP_ALIVE: TcpKeepalive = TcpKeepalive::new()
         .with_time(Duration::from_secs(60))
         .with_interval(Duration::from_secs(20))
         .with_retries(3);
 
-    &keep_alive
+    &KEEP_ALIVE
 }
 fn create_socket(bind: SocketAddr) -> anyhow::Result<socket2::Socket> {
     let sock = socket2::Socket::new(
