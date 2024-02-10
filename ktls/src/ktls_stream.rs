@@ -410,9 +410,7 @@ impl KtlsStream<tokio::net::TcpStream> {
                         tracing::trace!(?level, ?description, "got TLS alert");
                         this.read_closed = true;
                         this.write_closed = true;
-                        if let Err(_e) = crate::ffi::send_close_notify(this.inner.as_raw_fd()) {
-                            return;
-                        }
+                        if let Err(_e) = crate::ffi::send_close_notify(this.inner.as_raw_fd()) {}
                         // the file descriptor will be closed when the stream is dropped,
                         // we already protect against writes-after-close_notify through
                         // the write_closed flag

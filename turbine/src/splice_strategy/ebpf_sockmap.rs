@@ -1,14 +1,21 @@
-
 use aya::maps::{MapData, SockHash};
 use aya::programs::SkSkb;
 use aya::{include_bytes_aligned, Bpf};
 use aya_log::BpfLogger;
+use std::io;
+use std::net::SocketAddr;
+use std::ops::Deref;
+use std::os::fd::AsRawFd;
+
 use nix::libc;
 use once_cell::sync::Lazy;
-use tracing::{debug, info};
+use parking_lot::Mutex;
+use tokio::io::Interest;
+use tokio::net::TcpStream;
 use tracing::log::warn;
+use tracing::{debug, info};
 
-static SOCKS: Lazy<SockHash<MapData, u32>> = Lazy::new(|| {
+static SOCKS: Lazy<Mutex<(SockHash<MapData, u32>, Bpf)>> = Lazy::new(|| {
     let rlim = libc::rlimit {
         rlim_cur: libc::RLIM_INFINITY,
         rlim_max: libc::RLIM_INFINITY,
@@ -25,11 +32,13 @@ static SOCKS: Lazy<SockHash<MapData, u32>> = Lazy::new(|| {
     #[cfg(debug_assertions)]
     let mut bpf = Bpf::load(include_bytes_aligned!(
         "../../../target/bpfel-unknown-none/debug/splice-ebpf"
-    )).expect("Failed to load ebpf program. Make sure to build the project first.");
+    ))
+    .expect("Failed to load ebpf program. Make sure to build the project first.");
     #[cfg(not(debug_assertions))]
     let mut bpf = Bpf::load(include_bytes_aligned!(
         "../../../target/bpfel-unknown-none/release/splice-ebpf"
-    )).expect("Failed to load ebpf program. Make sure to build the project first.");
+    ))
+    .expect("Failed to load ebpf program. Make sure to build the project first.");
 
     #[cfg(debug_assertions)]
     if let Err(e) = BpfLogger::init(&mut bpf) {
@@ -38,11 +47,14 @@ static SOCKS: Lazy<SockHash<MapData, u32>> = Lazy::new(|| {
     }
 
     let intercept_ingress: SockHash<MapData, u32> = bpf
-        .take_map("INTERCEPT_INGRESS")
+        .take_map("INGRESS")
         .unwrap()
         .try_into()
         .expect("Failed to get ebpf map intercept ingress");
-    let map_fd = intercept_ingress.fd().try_clone().expect("Failed to clone map fd");
+    let map_fd = intercept_ingress
+        .fd()
+        .try_clone()
+        .expect("Failed to clone map fd");
 
     let prog: &mut SkSkb = bpf
         .program_mut("stream_parser")
@@ -62,12 +74,129 @@ static SOCKS: Lazy<SockHash<MapData, u32>> = Lazy::new(|| {
     prog.attach(&map_fd)
         .expect("Failed to attach ebpf stream verdict");
 
-    intercept_ingress
+    Mutex::new((intercept_ingress, bpf))
 });
 
-pub fn init() {
-    info!("Hello");
-    SOCKS.iter().for_each(|key| {
-        info!("sockmap key: {:?}", key);
-    });
+pub struct SockMapSplice {
+    socks: &'static Mutex<(SockHash<MapData, u32>, Bpf)>,
+}
+
+impl Default for SockMapSplice {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SockMapSplice {
+    pub fn new() -> Self {
+        Self {
+            socks: SOCKS.deref(),
+        }
+    }
+
+    pub async fn splice(
+        &self,
+        local: &mut TcpStream,
+        upstream: &mut TcpStream,
+    ) -> Result<(), io::Error> {
+        let key = socket_hash(local.local_addr().unwrap(), local.peer_addr().unwrap());
+        if let Err(err) = self.socks.lock().0.insert(key, upstream.as_raw_fd(), 0) {
+            warn!("{:?}", err);
+            return Ok(());
+        }
+
+        let key = socket_hash(
+            upstream.local_addr().unwrap(),
+            upstream.peer_addr().unwrap(),
+        );
+        if let Err(err) = self.socks.lock().0.insert(key, local.as_raw_fd(), 0) {
+            warn!("{:?}", err);
+            return Ok(());
+        }
+
+        // We need to forward the already buffered packet in user space
+        let _ = tokio::io::copy_bidirectional(local, upstream).await;
+        //select! {
+        //    ret = await_termination(local) => {
+        //        info!("local socket terminated: {:?}", ret);
+        //    },
+        //    ret = await_termination(upstream) => {
+        //        info!("upstream socket terminated {:?}", ret);
+        //    }
+        //}
+        info!("Connection closed");
+
+        Ok(())
+    }
+}
+
+async fn await_termination(sock: &mut TcpStream) -> anyhow::Result<()> {
+    let _ = sock.ready(Interest::READABLE.add(Interest::ERROR)).await;
+    let _ = sock.ready(Interest::ERROR).await;
+
+    Ok(())
+}
+
+#[inline(always)]
+fn socket_hash(local_addr: SocketAddr, peer_addr: SocketAddr) -> u32 {
+    let (lip, lport) = match local_addr {
+        SocketAddr::V4(s) => (u128::from(s.ip().to_ipv6_mapped()), s.port() as u32),
+        SocketAddr::V6(s) => (u128::from(*s.ip()), s.port() as u32),
+    };
+    let (rip, rport) = match peer_addr {
+        SocketAddr::V4(s) => (u128::from(s.ip().to_ipv6_mapped()), s.port() as u32),
+        SocketAddr::V6(s) => (u128::from(*s.ip()), s.port() as u32),
+    };
+
+    let [a, aa, aaa, aaaa, b, bb, bbb, bbbb, c, cc, ccc, cccc, d, dd, ddd, dddd] =
+        lip.to_be_bytes();
+    let mut key: u32 = u32::from_be_bytes([a, aa, aaa, aaaa]).to_be();
+    key = 31u32
+        .overflowing_mul(key)
+        .0
+        .overflowing_add(u32::from_be_bytes([b, bb, bbb, bbbb]).to_be())
+        .0;
+    key = 31u32
+        .overflowing_mul(key)
+        .0
+        .overflowing_add(u32::from_be_bytes([c, cc, ccc, cccc]).to_be())
+        .0;
+    key = 31u32
+        .overflowing_mul(key)
+        .0
+        .overflowing_add(u32::from_be_bytes([d, dd, ddd, dddd]).to_be())
+        .0;
+
+    // local port is in host byte order
+    // https://codebrowser.dev/linux/linux/include/uapi/linux/bpf.h.html#6117
+    key = 31u32.overflowing_mul(key).0.overflowing_add(lport).0;
+
+    let [a, aa, aaa, aaaa, b, bb, bbb, bbbb, c, cc, ccc, cccc, d, dd, ddd, dddd] =
+        rip.to_be_bytes();
+    key = 31u32
+        .overflowing_mul(key)
+        .0
+        .overflowing_add(u32::from_be_bytes([a, aa, aaa, aaaa]).to_be())
+        .0;
+    key = 31u32
+        .overflowing_mul(key)
+        .0
+        .overflowing_add(u32::from_be_bytes([b, bb, bbb, bbbb]).to_be())
+        .0;
+    key = 31u32
+        .overflowing_mul(key)
+        .0
+        .overflowing_add(u32::from_be_bytes([c, cc, ccc, cccc]).to_be())
+        .0;
+    key = 31u32
+        .overflowing_mul(key)
+        .0
+        .overflowing_add(u32::from_be_bytes([d, dd, ddd, dddd]).to_be())
+        .0;
+    key = 31u32
+        .overflowing_mul(key)
+        .0
+        .overflowing_add(rport.to_be())
+        .0;
+    key
 }

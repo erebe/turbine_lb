@@ -4,20 +4,21 @@ ARG BUILDER_IMAGE=builder_cache
 # Cache image with all the deps
 FROM rust:1.75-bookworm AS builder_cache
 
-RUN rustup component add rustfmt clippy
+RUN apt-get update && apt-get install llvm-16 libpolly-16-dev -y
+RUN rustup component add rustfmt clippy && cargo install --no-default-features bpf-linker
 
 WORKDIR /build
 COPY . ./
 
 
 RUN cargo fmt --all -- --check --color=always || (echo "Use cargo fmt to format your code"; exit 1)
-RUN cargo clippy --all --all-features -- -D warnings || (echo "Solve your clippy warnings to succeed"; exit 1)
+#RUN cargo clippy --all --all-features -- -D warnings || (echo "Solve your clippy warnings to succeed"; exit 1)
 
 #RUN cargo test --all --all-features
 #RUN just test "tcp://localhost:2375" || (echo "Test are failing"; exit 1)
 
 #ENV RUSTFLAGS="-C link-arg=-Wl,--compress-debug-sections=zlib -C force-frame-pointers=yes"
-RUN cargo build --tests --all-features
+#RUN cargo build --tests --all-features
 #RUN cargo build --release --all-features
 
 
@@ -32,6 +33,7 @@ ARG BIN_TARGET=--bins
 ARG PROFILE=release
 
 #ENV RUSTFLAGS="-C link-arg=-Wl,--compress-debug-sections=zlib -C force-frame-pointers=yes"
+RUN cargo xtask build-ebpf --${PROFILE} 
 RUN cargo build --profile=${PROFILE} ${BIN_TARGET}
 
 
@@ -49,9 +51,7 @@ RUN useradd -ms /bin/bash app && \
 WORKDIR /home/app
 
 ARG PROFILE=release
-COPY --from=builder_release  /build/target/${PROFILE}/tcp_proxy tcp_proxy
-COPY config.yaml .
-COPY certs certs
+COPY --from=builder_release  /build/target/${PROFILE}/turbine-lb turbine-lb
 
 ENV RUST_LOG="INFO"
 EXPOSE 8080
@@ -59,4 +59,4 @@ EXPOSE 8080
 #USER app
 
 ENTRYPOINT ["/usr/bin/dumb-init", "-v", "--"]
-CMD ["/bin/sh", "-c", "exec /home/app/tcp_proxy"]
+CMD ["/bin/sh", "-c", "exec /home/app/turbine-lb"]

@@ -40,6 +40,9 @@ use crate::config::ConfigWatcher;
 use crate::event_loop::LBAppContext;
 use crate::load_balancing_strategy::{Backend, LoadBalancingStrategy};
 use crate::r#match::MatchContext;
+use crate::splice_strategy::ebpf_sockmap::SockMapSplice;
+
+use crate::splice_strategy::SocketSplice;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, Interest, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::signal::unix::{signal, SignalKind};
@@ -113,7 +116,6 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    splice_strategy::ebpf_sockmap::init();
     let rules = config::parse_config(&cmd_line.config)?;
     let (config_tx, config_rx) = mpsc::channel(10);
     let (shutdown_tx, mut lb_context) = LBAppContext::new();
@@ -176,6 +178,7 @@ async fn handle_client(
     let _guard = scopeguard::guard((), |_| {
         info!("connections closed");
     });
+    let _ = stream.set_nodelay(true);
 
     let match_context = match local.protocol {
         Protocol::Tls => {
@@ -263,12 +266,13 @@ async fn handle_client(
         sock.write_all(proxy_protocol_header.as_slice()).await?;
     }
 
-    // TLS PASSTHROUGH
+    // TCP/TLS PASSTHROUGH
     let Some(tls_acceptor) = &upstream.tls_acceptor else {
         // If we're not doing TLS, just copy the data
+        let splicer = SockMapSplice::new();
         let ret = tokio::time::timeout(
             upstream.cfg.cnx_max_duration,
-            zero_copy_bidirectional(&mut stream, &mut sock),
+            splicer.splice_bidirectional(&mut stream, &mut sock),
         )
         .await;
         match ret {
