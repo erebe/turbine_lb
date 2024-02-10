@@ -25,7 +25,8 @@ use rustls::internal::msgs::message::{Message, MessagePayload};
 use rustls::internal::record_layer::RecordLayer;
 use rustls::server::DnsName;
 
-use socket2::{Domain, SockAddr};
+
+use socket2::{Domain, SockAddr, SockRef, TcpKeepalive};
 use std::io::{Error, IoSlice};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::{AsRawFd, RawFd};
@@ -152,12 +153,21 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn tcp_keep_alive_cfg() -> &'static TcpKeepalive {
+    static keep_alive: TcpKeepalive = TcpKeepalive::new()
+        .with_time(Duration::from_secs(60))
+        .with_interval(Duration::from_secs(20))
+        .with_retries(3);
+
+    &keep_alive
+}
 fn create_socket(bind: SocketAddr) -> anyhow::Result<socket2::Socket> {
     let sock = socket2::Socket::new(
         Domain::for_address(bind),
         socket2::Type::STREAM,
         Some(socket2::Protocol::TCP),
     )?;
+    sock.set_tcp_keepalive(tcp_keep_alive_cfg())?;
     sock.set_reuse_address(true)?;
     sock.set_reuse_port(true)?;
     //sock.set_ip_transparent(true)?;
@@ -178,7 +188,8 @@ async fn handle_client(
     let _guard = scopeguard::guard((), |_| {
         info!("connections closed");
     });
-    let _ = stream.set_nodelay(true);
+    stream.set_nodelay(true)?;
+    SockRef::from(&stream).set_tcp_keepalive(tcp_keep_alive_cfg())?;
 
     let match_context = match local.protocol {
         Protocol::Tls => {
