@@ -9,4 +9,5 @@
 * TLS sni inspection for routing (without terminating TLS)
 * TLS termination with KTLS
 * "zero-copy" using splice syscall
+* proxy protocol v2
 * linux only
