@@ -12,3 +12,6 @@
 * support proxy protocol v2
 * auto reload config and certificate
 * linux only
+
+
+config example at https://github.com/erebe/turbine_lb/blob/main/config.yaml
