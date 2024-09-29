@@ -12,7 +12,7 @@ scopeguard = "1.2.0"
 once_cell = "1.19.0"
 
 ppp = { version = "2.2.0" }
-nix = { version = "0.27.1", features = ["socket", "net", "uio", "zerocopy"] }
+nix = { version = "0.29.0", features = ["socket", "net", "uio", "zerocopy"] }
 socket2 = { version = "0.5.5", features = [] }
 tokio = { version = "1.34.0", features = ["full"] }
 tokio-splice = "0.2.0"
@@ -22,8 +22,8 @@ rustls-pemfile = {  version = "2.0.0", features = [] }
 ktls = {  path = "../ktls" }
 serde = {  version = "1.0.196", features = ["derive"] }
 serde_yaml = {  version = "0.9.31", features = [] }
-duration-str = {  version = "0.7.1", features = [] }
-nonempty = {  version = "0.9.0", features = ["serialize"] }
+duration-str = {  version = "0.11.2", features = [] }
+nonempty = {  version = "0.10.0", features = ["serialize"] }
 notify = { version = "6.1.1", features = [] }
 parking_lot = "0.12.1"
 futures = "0.3.30"
@@ -32,5 +32,5 @@ aya-log = { git = "https://github.com/aya-rs/aya" }
 
 tracing = { version = "0.1.40", features = ["log"] }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "fmt", "local-time"] }
-tikv-jemallocator = "0.5"
+tikv-jemallocator = "0.6.0"
 

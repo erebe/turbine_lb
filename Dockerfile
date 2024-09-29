@@ -2,7 +2,7 @@ ARG BUILDER_IMAGE=builder_cache
 
 ############################################################
 # Cache image with all the deps
-FROM rust:1.75-bookworm AS builder_cache
+FROM rust:1.81-bookworm AS builder_cache
 
 RUN apt-get update && apt-get install llvm-16 libpolly-16-dev -y
 RUN rustup component add rustfmt clippy && cargo install --no-default-features bpf-linker
