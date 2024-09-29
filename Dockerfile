@@ -4,7 +4,9 @@ ARG BUILDER_IMAGE=builder_cache
 # Cache image with all the deps
 FROM rust:1.81-bookworm AS builder_cache
 
-RUN apt-get update && apt-get install llvm-16 libpolly-16-dev -y
+RUN echo 'deb https://deb.debian.org/debian unstable main' >> /etc/apt/sources.list  && \ 
+  apt-get update && \  
+  apt -t unstable install llvm-19 libpolly-19-dev -y
 RUN rustup component add rustfmt clippy && cargo install --no-default-features bpf-linker
 
 WORKDIR /build
