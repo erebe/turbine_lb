@@ -1,5 +1,6 @@
 use duration_str::deserialize_duration;
 use nonempty::NonEmpty;
+use regex::Regex;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -44,6 +45,8 @@ pub enum MatchConfig {
     Any,
     None,
     Sni(String),
+    #[serde(with = "serde_regex")]
+    SniRegex(Regex),
     Alpn(String),
     DestinationPort(u16),
 }

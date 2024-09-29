@@ -39,6 +39,11 @@ impl MatchContext {
                     .as_ref()
                     .map(|cnx_sni| cnx_sni.as_ref() == sni.as_str())
                     .unwrap_or(false),
+                MatchConfig::SniRegex(sni) => self
+                    .sni
+                    .as_ref()
+                    .map(|cnx_sni| sni.is_match(cnx_sni.as_ref()))
+                    .unwrap_or(false),
                 MatchConfig::DestinationPort(dport) => self.destination.port() == *dport,
                 MatchConfig::Alpn(alpn) => {
                     let Some(cnx_alpn) = &self.alpns else {
