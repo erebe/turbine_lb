@@ -47,6 +47,8 @@ pub enum MatchConfig {
     Sni(String),
     #[serde(with = "serde_regex")]
     SniRegex(Regex),
+    #[serde(with = "serde_regex")]
+    SniRegexNot(Regex),
     Alpn(String),
     DestinationPort(u16),
 }
