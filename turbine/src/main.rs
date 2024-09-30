@@ -40,8 +40,8 @@ use crate::config::ConfigWatcher;
 use crate::event_loop::LBAppContext;
 use crate::load_balancing_strategy::{Backend, LoadBalancingStrategy};
 use crate::r#match::MatchContext;
-use crate::splice_strategy::ebpf_sockmap::SockMapSplice;
 
+use crate::splice_strategy::splice::SpliceSyscall;
 use crate::splice_strategy::SocketSplice;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, Interest, ReadBuf};
 use tokio::net::TcpStream;
@@ -127,8 +127,8 @@ async fn main() -> anyhow::Result<()> {
     let _config_watch = ConfigWatcher::new(cmd_line.config.clone(), config_tx)
         .expect("Cannot watch for config file changes");
 
-    let mut sigterm = signal(SignalKind::terminate()).unwrap();
-    let mut sigint = signal(SignalKind::interrupt()).unwrap();
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
     select! {
         biased;
         _ = sigterm.recv() => info!("Receive SIGTERM. Waiting 15 to receive in-flight connection"),
@@ -292,7 +292,7 @@ async fn handle_client(
     // TCP/TLS PASSTHROUGH
     let Some(tls_acceptor) = &upstream.tls_acceptor else {
         // If we're not doing TLS, just copy the data
-        let splicer = SockMapSplice::new();
+        let splicer = SpliceSyscall {};
         let ret = tokio::time::timeout(
             upstream.cfg.cnx_max_duration,
             splicer.splice_bidirectional(&mut stream, &mut sock),
