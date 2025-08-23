@@ -1,20 +1,23 @@
 use crate::config::types::MatchConfig;
-use crate::Upstream;
+use crate::{ProtocolName, Upstream};
 use nonempty::NonEmpty;
-use rustls::internal::msgs::handshake::{ConvertProtocolNameList, ProtocolName};
-use rustls::server::DnsName;
+use rustls::pki_types::DnsName;
 use std::net::SocketAddr;
 use tokio::net::TcpStream;
 
 #[derive(Debug)]
 pub struct MatchContext {
-    sni: Option<DnsName>,
+    sni: Option<DnsName<'static>>,
     alpns: Option<Vec<ProtocolName>>,
     destination: SocketAddr,
 }
 
 impl MatchContext {
-    pub fn new(stream: &TcpStream, sni: Option<DnsName>, alpn: Option<Vec<ProtocolName>>) -> Self {
+    pub fn new(
+        stream: &TcpStream,
+        sni: Option<DnsName<'static>>,
+        alpn: Option<Vec<ProtocolName>>,
+    ) -> Self {
         Self {
             sni,
             alpns: alpn,
@@ -54,10 +57,7 @@ impl MatchContext {
                     let Some(cnx_alpn) = &self.alpns else {
                         return false;
                     };
-                    cnx_alpn
-                        .to_slices()
-                        .iter()
-                        .any(|cnx_alpn| *cnx_alpn == alpn.as_bytes())
+                    cnx_alpn.iter().any(|cnx_alpn| *cnx_alpn == alpn.as_bytes())
                 }
             })
     }

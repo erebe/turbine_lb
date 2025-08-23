@@ -2,12 +2,12 @@ ARG BUILDER_IMAGE=builder_cache
 
 ############################################################
 # Cache image with all the deps
-FROM rust:1.81-bookworm AS builder_cache
+FROM rust:1.89-trixie AS builder_cache
 
-RUN echo 'deb https://deb.debian.org/debian unstable main' >> /etc/apt/sources.list  && \ 
-  apt-get update && \  
+RUN echo 'deb https://deb.debian.org/debian unstable main' >> /etc/apt/sources.list  && \
+  apt-get update && \
   apt -t unstable install llvm-19 libpolly-19-dev -y
-RUN rustup component add rustfmt clippy && cargo install --no-default-features bpf-linker
+RUN rustup component add rustfmt clippy # && cargo install --no-default-features bpf-linker
 
 WORKDIR /build
 COPY . ./
@@ -35,13 +35,13 @@ ARG BIN_TARGET=--bins
 ARG PROFILE=release
 
 #ENV RUSTFLAGS="-C link-arg=-Wl,--compress-debug-sections=zlib -C force-frame-pointers=yes"
-RUN cargo xtask build-ebpf --${PROFILE} 
+#RUN cargo xtask build-ebpf --${PROFILE}
 RUN cargo build --profile=${PROFILE} ${BIN_TARGET}
 
 
 ############################################################
 # Final image
-FROM debian:bookworm-slim as final-image
+FROM debian:trixie-slim as final-image
 
 RUN useradd -ms /bin/bash app && \
         apt-get update && \

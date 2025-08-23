@@ -6,33 +6,32 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-clap = { version = "4.4.10", features = ["derive", "env"] }
-anyhow = "1.0.75"
+clap = { version = "4.5.45", features = ["derive", "env"] }
+anyhow = "1.0.99"
 scopeguard = "1.2.0"
-once_cell = "1.19.0"
-regex = { version = "1.10.6", default-features = false, features = ["std", "perf"] }
+regex = { version = "1.11.1", default-features = false, features = ["std", "perf"] }
 serde_regex = "1.1.0"
 
-ppp = { version = "2.2.0" }
-nix = { version = "0.29.0", features = ["socket", "net", "uio", "zerocopy"] }
-socket2 = { version = "0.5.5", features = [] }
-tokio = { version = "1.34.0", features = ["full"] }
-tokio-splice = "0.2.0"
-tokio-rustls = {  version = "0.24.1", features = ["tls12"] }
-rustls = { version = "0.21.10", features = ["tls12", "dangerous_configuration"] }
-rustls-pemfile = {  version = "2.0.0", features = [] }
-ktls = {  path = "../ktls" }
-serde = {  version = "1.0.196", features = ["derive"] }
-serde_yaml = {  version = "0.9.31", features = [] }
-duration-str = {  version = "0.11.2", features = [] }
-nonempty = {  version = "0.10.0", features = ["serialize"] }
-notify = { version = "6.1.1", features = [] }
-parking_lot = "0.12.1"
-futures = "0.3.30"
+ppp = { version = "2.3.0" }
+nix = { version = "0.30.1", features = ["socket", "net", "uio", "zerocopy"] }
+socket2 = { version = "0.6.0", features = ["all"] }
+tokio = { version = "1.47.1", features = ["full"] }
+tokio-splice = "0.2.1"
+tokio-rustls = {  version = "0.26.2", features = ["aws-lc-rs"] }
+rustls = { version = "0.23.31", features = ["tls12", "aws-lc-rs"] }
+rustls-pemfile = {  version = "2.2.0", features = [] }
+ktls = { version = "6.0.2", features = ["aws-lc-rs", "tls12"] }
+serde = {  version = "1.0.219", features = ["derive"] }
+serde_yaml = {  version = "0.9.34", features = [] }
+duration-str = {  version = "0.17.0", features = [] }
+nonempty = {  version = "0.12.0", features = ["serialize"] }
+notify = { version = "8.2.0", features = [] }
+parking_lot = "0.12.4"
+futures = "0.3.31"
 aya = { git = "https://github.com/aya-rs/aya", features = ["async_tokio"] }
 aya-log = { git = "https://github.com/aya-rs/aya" }
 
-tracing = { version = "0.1.40", features = ["log"] }
-tracing-subscriber = { version = "0.3.18", features = ["env-filter", "fmt", "local-time"] }
+tracing = { version = "0.1.41", features = ["log"] }
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt", "local-time"] }
 tikv-jemallocator = "0.6.0"
 

@@ -14,17 +14,18 @@ mod peekable_stream;
 mod splice_strategy;
 mod tls;
 
-use crate::peekable_stream::PeekableStream;
 use anyhow::Context;
 use clap::Parser;
 use ktls::KtlsStream;
 use nonempty::NonEmpty;
-use rustls::internal::msgs::deframer::MessageDeframer;
-use rustls::internal::msgs::handshake::{ConvertServerNameList, HandshakePayload, ProtocolName};
-use rustls::internal::msgs::message::{Message, MessagePayload};
-use rustls::internal::record_layer::RecordLayer;
-use rustls::server::DnsName;
 
+use crate::config::types::{Protocol, UpstreamConfig};
+use crate::config::ConfigWatcher;
+use crate::event_loop::LBAppContext;
+use crate::load_balancing_strategy::{Backend, LoadBalancingStrategy};
+use crate::r#match::MatchContext;
+use rustls::pki_types::DnsName;
+use rustls::server::Acceptor;
 use socket2::{Domain, SockAddr, SockRef, TcpKeepalive};
 use std::io::{Error, IoSlice};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -35,14 +36,10 @@ use std::sync::atomic::Ordering;
 use std::task::Poll;
 use std::time::Duration;
 
-use crate::config::types::{Protocol, UpstreamConfig};
-use crate::config::ConfigWatcher;
-use crate::event_loop::LBAppContext;
-use crate::load_balancing_strategy::{Backend, LoadBalancingStrategy};
-use crate::r#match::MatchContext;
-
+use crate::peekable_stream::PeekableStream;
 use crate::splice_strategy::splice::SpliceSyscall;
 use crate::splice_strategy::SocketSplice;
+use crate::tls::ProtocolName;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, Interest, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::signal::unix::{signal, SignalKind};
@@ -184,7 +181,7 @@ fn create_socket(bind: SocketAddr) -> anyhow::Result<socket2::Socket> {
     sock.set_reuse_port(true)?;
     //sock.set_ip_transparent(true)?;
     sock.set_keepalive(true)?;
-    sock.set_nodelay(true)?;
+    sock.set_tcp_nodelay(true)?;
     sock.set_nonblocking(true)?;
     sock.bind(&SockAddr::from(bind))?;
 
@@ -205,7 +202,9 @@ async fn handle_client(
 
     let match_context = match local.protocol {
         Protocol::Tls => {
-            let (sni, alpns) = extract_tls_info(&stream).await?;
+            let (sni, alpns) = extract_tls_info(&mut stream)
+                .await
+                .with_context(|| "Cannot extract TLS info")?;
             debug!("SNI: {:?}", sni.as_ref().map(|x| x.as_ref()).unwrap_or(""));
             MatchContext::new(&stream, sni, alpns)
         }
@@ -317,12 +316,9 @@ async fn handle_client(
     // Setup KTLS
     let tls_stream = tls_acceptor.accept(ktls::CorkStream::new(stream)).await?;
     let ktls_stream = ktls::config_ktls_server(tls_stream).await?;
-    let (drain, tcp) = ktls_stream.into_raw();
+    let (drain, mut ktls_stream) = ktls_stream.into_raw();
     if let Some(data) = drain {
         sock.write_all(&data).await?;
-    };
-    let mut ktls_stream = KtlsTcpStream {
-        inner: KtlsStream::new(tcp, None),
     };
 
     // Data transfer loop
@@ -355,113 +351,41 @@ async fn handle_client(
 }
 
 async fn extract_tls_info(
-    stream: &TcpStream,
-) -> anyhow::Result<(Option<DnsName>, Option<Vec<ProtocolName>>)> {
-    let mut tls_deframer = MessageDeframer::default();
-    let mut record_layer = RecordLayer::new();
-    let mut peek_stream = PeekableStream::new(stream);
-
+    stream: &mut TcpStream,
+) -> anyhow::Result<(Option<DnsName<'static>>, Option<Vec<ProtocolName>>)> {
     stream.readable().await?;
-    tls_deframer.read(&mut peek_stream)?;
-    let msg = tls_deframer
-        .pop(&mut record_layer)?
-        .with_context(|| "No TLS frame read")?;
-    let msg = Message::try_from(msg.message)?;
-    let (snv_names, alpns) = match &msg.payload {
-        MessagePayload::Handshake { parsed, .. } => match &parsed.payload {
-            HandshakePayload::ClientHello(msg) => {
-                (msg.get_sni_extension(), msg.get_alpn_extension())
+    let mut peekable_stream = PeekableStream::new(stream);
+
+    let mut ix = 10;
+    let ret = loop {
+        let mut acceptor = Acceptor::default();
+        let _ = acceptor.read_tls(&mut peekable_stream)?;
+        match acceptor.accept() {
+            Ok(Some(ret)) => break ret,
+            Ok(None) => {
+                ix -= 1;
+                if ix == 0 {
+                    anyhow::bail!("Error while reading TLS: Timeout");
+                }
+
+                warn!("No TLS record received. Retrying...");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
             }
-            msg => {
-                return Err(anyhow::Error::msg(format!(
-                    "Invalid TLS msg, expecting client hello handshake: {:?}",
-                    msg
-                )))
+            Err((err, mut alert)) => {
+                let _ = alert.write_all(&mut peekable_stream);
+                anyhow::bail!("Error while reading TLS: {:?}", err)
             }
-        },
-        msg => {
-            return Err(anyhow::Error::msg(format!(
-                "Invalid TLS msg, expecting client hello handshake: {:?}",
-                msg
-            )))
         }
     };
+    let sni = ret
+        .client_hello()
+        .server_name()
+        .and_then(|s| DnsName::try_from(s.to_string()).ok());
+    let alpns = ret
+        .client_hello()
+        .alpn()
+        .map(|p| p.map(|p| p.to_owned()).collect::<Vec<ProtocolName>>());
 
-    let sni = snv_names.and_then(|s| s.get_single_hostname());
-
-    anyhow::Ok((sni.map(|x| x.to_owned()), alpns.map(|x| x.to_owned())))
-}
-
-pub struct KtlsTcpStream {
-    pub inner: KtlsStream<TcpStream>,
-}
-
-impl AsyncRead for KtlsTcpStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        unsafe { Pin::new_unchecked(&mut self.inner) }.poll_read(cx, buf)
-    }
-}
-
-impl AsRawFd for KtlsTcpStream {
-    fn as_raw_fd(&self) -> RawFd {
-        self.inner.as_raw_fd()
-    }
-}
-
-impl AsyncWrite for KtlsTcpStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, Error>> {
-        unsafe { Pin::new_unchecked(&mut self.inner) }.poll_write(cx, buf)
-    }
-
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Result<(), Error>> {
-        unsafe { Pin::new_unchecked(&mut self.inner) }.poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Result<(), Error>> {
-        unsafe { Pin::new_unchecked(&mut self.inner) }.poll_shutdown(cx)
-    }
-
-    fn poll_write_vectored(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        bufs: &[IoSlice<'_>],
-    ) -> Poll<Result<usize, Error>> {
-        unsafe { Pin::new_unchecked(&mut self.inner) }.poll_write_vectored(cx, bufs)
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        self.inner.is_write_vectored()
-    }
-}
-
-impl Stream for KtlsTcpStream {
-    fn poll_read_ready_n(&self, cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
-        self.inner.poll_read_ready(cx)
-    }
-
-    fn poll_write_ready_n(&self, cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
-        self.inner.poll_write_ready(cx)
-    }
-
-    fn try_io_n<R>(
-        &self,
-        interest: Interest,
-        f: impl FnOnce() -> std::io::Result<R>,
-    ) -> std::io::Result<R> {
-        self.inner.try_io(interest, f)
-    }
+    anyhow::Ok((sni, alpns))
 }
