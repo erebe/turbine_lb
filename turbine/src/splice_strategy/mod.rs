@@ -17,23 +17,15 @@ pub trait SocketSplice {
     ) -> io::Result<()>;
 }
 
-// impl SocketSplice for SockMapSplice {
-//     async fn splice_bidirectional(
-//         &self,
-//         local: &mut TcpStream,
-//         upstream: &mut TcpStream,
-//     ) -> io::Result<()> {
-//         self.splice(local, upstream).await
-//     }
-
-//     async fn splice_ktls_bidirectional(
-//         &self,
-//         _local: &mut KtlsTcpStream,
-//         _upstream: &mut TcpStream,
-//     ) -> io::Result<()> {
-//         todo!()
-//     }
-// }
+//impl SocketSplice for SockMapSplice {
+//    async fn splice_bidirectional(
+//        &self,
+//        local: &mut TcpStream,
+//        upstream: &mut TcpStream,
+//    ) -> io::Result<()> {
+//        self.splice(local, upstream).await
+//    }
+//}
 
 impl SocketSplice for NaiveSplice {
     async fn splice_bidirectional(

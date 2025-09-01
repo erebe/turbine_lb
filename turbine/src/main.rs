@@ -325,24 +325,22 @@ async fn handle_client(
     let timeout = tokio::time::sleep(upstream.cfg.cnx_max_duration);
     pin!(timeout);
     loop {
-        select! {
+        let bytes_read = select! {
             biased;
 
-            ret = zero_copy_bidirectional(&mut ktls_stream, &mut sock) => {
-                if let Err(err) = ret {
-                   // if err.kind() == InvalidInput {
-                   //         ktls_stream.inner.handle_msg();
-                   //     warn!("error while copying data: {:?}", err);
-                   //     continue;
-                   // }
-                   warn!("closing cnx {:?}", err);
-                        break;
-                }
-            }
-
+            bytes_read = zero_copy_bidirectional(&mut ktls_stream, &mut sock) => bytes_read,
             _ = &mut timeout => {
                warn!("timeout of {:?} elapsed. Closing cnx", upstream.cfg.cnx_max_duration);
                     break;
+            }
+        };
+
+        match bytes_read {
+            Ok((0, 0)) => break,
+            Ok(_) => continue,
+            Err(err) => {
+                warn!("closing cnx {:?}", err);
+                break;
             }
         }
     }

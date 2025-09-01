@@ -2,20 +2,19 @@ use aya::maps::{MapData, SockHash};
 use aya::programs::SkSkb;
 use aya::{include_bytes_aligned, Bpf};
 use aya_log::BpfLogger;
+use nix::libc;
+use parking_lot::Mutex;
 use std::io;
 use std::net::SocketAddr;
 use std::ops::Deref;
 use std::os::fd::AsRawFd;
-
-use nix::libc;
-use once_cell::sync::Lazy;
-use parking_lot::Mutex;
-use tokio::io::Interest;
+use std::sync::LazyLock;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
 use tokio::net::TcpStream;
 use tracing::log::warn;
 use tracing::{debug, info};
 
-static SOCKS: Lazy<Mutex<(SockHash<MapData, u32>, Bpf)>> = Lazy::new(|| {
+static SOCKS: LazyLock<Mutex<(SockHash<MapData, u32>, Bpf)>> = LazyLock::new(|| {
     let rlim = libc::rlimit {
         rlim_cur: libc::RLIM_INFINITY,
         rlim_max: libc::RLIM_INFINITY,
@@ -99,12 +98,6 @@ impl SockMapSplice {
         local: &mut TcpStream,
         upstream: &mut TcpStream,
     ) -> Result<(), io::Error> {
-        let key = socket_hash(local.local_addr().unwrap(), local.peer_addr().unwrap());
-        if let Err(err) = self.socks.lock().0.insert(key, upstream.as_raw_fd(), 0) {
-            warn!("{:?}", err);
-            return Ok(());
-        }
-
         let key = socket_hash(
             upstream.local_addr().unwrap(),
             upstream.peer_addr().unwrap(),
@@ -112,6 +105,23 @@ impl SockMapSplice {
         if let Err(err) = self.socks.lock().0.insert(key, local.as_raw_fd(), 0) {
             warn!("{:?}", err);
             return Ok(());
+        }
+
+        let mut buf = [0u8; 1024 * 8];
+        loop {
+            match local.try_read(&mut buf) {
+                Ok(len) => {
+                    let key = socket_hash(local.local_addr().unwrap(), local.peer_addr().unwrap());
+                    if let Err(err) = self.socks.lock().0.insert(key, upstream.as_raw_fd(), 0) {
+                        warn!("{:?}", err);
+                        return Ok(());
+                    }
+                    upstream.write_all(&buf[..len]).await?;
+                }
+                Err(WouldBlock) => {
+                    break;
+                }
+            };
         }
 
         // We need to forward the already buffered packet in user space
