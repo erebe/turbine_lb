@@ -1,8 +1,7 @@
 rules:
-- listen_addr: 
+- listen_addr:
     - "[::]:25"
     - "[::]:587"
-    - "[::]:993"
   protocol: Tcp
   upstreams:
     - name: smtp
@@ -13,66 +12,51 @@ rules:
       cnx_max_duration: 5m
       load_balancing: !RoundRobin
 
-    - name: smtps
+    - name: smtp
       match: !DestinationPort 587
       backends: !Static
-        - addr: "127.0.0.1:588"
-      proxy_protocol: false
+        - addr: "[fd00:cafe::5]:25"
+      proxy_protocol: true
       cnx_max_duration: 5m
       load_balancing: !RoundRobin
 
-    - name: imaps
-      match: !DestinationPort 993
-      backends: !Static
-        - addr: "[fd00:cafe::5]:993"
-      proxy_protocol: false
-      cnx_max_duration: 10m
-      load_balancing: !RoundRobin
 
-- listen_addr: 
+- listen_addr:
     - "[::]:443"
   protocol: Tls
   upstreams:
-    - name: wstunnel
-      match: !Sni ws.erebe.eu
+    - name: wstunnel-demo
+      match: !SniRegexNot \.erebe\.(dev|eu|eus)$
       backends: !Static
         - addr: "[fd00:cafe::254]:8084"
       proxy_protocol: false
-      cnx_max_duration: 1h
+      cnx_max_duration: 10s
       load_balancing: !RoundRobin
 
-    - name: nginx-https
-      match: !Any
+    - name: wstunnel
+      match: !SniRegex ws\.erebe\.(dev|eu|eus)$
       backends: !Static
-        - addr: "[fd00:cafe::254]:444"
-      proxy_protocol: true
-      cnx_max_duration: 10m
+        - addr: "[fd00:cafe::254]:8084"
+      proxy_protocol: false
+      cnx_max_duration: 10s
       load_balancing: !RoundRobin
 
-- listen_addr: 
-    - "[::]:80"
-  protocol: Tcp
-  upstreams:
-    - name: nginx-http
+    - name: envoy-https
       match: !Any
       backends: !Static
-        - addr: "[fd00:cafe::254]:81"
+        - addr: "10.43.0.11:444"
       proxy_protocol: true
       cnx_max_duration: 10m
       load_balancing: !RoundRobin
 
 - listen_addr:
-  - "[::]:8089"
-  protocol: Tls
+    - "[::]:443"
+  protocol: Udp
   upstreams:
-    - name: test
+    - name: wstunnel
       match: !Any
       backends: !Static
-        - addr: "[2a01:4f8:0:a232::2]:80"
+        - addr: "[fd00:cafe::254]:8084"
       proxy_protocol: false
-      cnx_max_duration: 10m
+      cnx_max_duration: 10s
       load_balancing: !RoundRobin
-        #tls:
-        #  certificate: /etc/certs.d/erebe.eu/tls.crt
-        #  private_key: /etc/certs.d/erebe.eu/tls.key
-        #  alpns: ["h2"]

@@ -1,7 +1,8 @@
+use crate::config::types::{ListenerKey, Protocol};
+use crate::udp::run_udp_listener;
 use crate::{create_socket, handle_client, Rule};
 use futures::task::noop_waker_ref;
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -31,9 +32,9 @@ impl LBAppContext {
 
     pub async fn listen_config_change(
         &mut self,
-        mut config_changes_rx: mpsc::Receiver<HashMap<SocketAddr, Arc<Rule>>>,
+        mut config_changes_rx: mpsc::Receiver<HashMap<ListenerKey, Arc<Rule>>>,
     ) {
-        let mut listeners: HashMap<SocketAddr, watch::Sender<Arc<Rule>>> = HashMap::new();
+        let mut listeners: HashMap<ListenerKey, watch::Sender<Arc<Rule>>> = HashMap::new();
         info!("Starting Load balancer");
 
         loop {
@@ -59,14 +60,14 @@ impl LBAppContext {
             info!("reloading configuration");
             listeners.retain(|k, _| listeners_update.contains_key(k));
 
-            for (listen_addr, config) in listeners_update.into_iter() {
-                match listeners.get(&listen_addr) {
+            for (listener_key, config) in listeners_update.into_iter() {
+                match listeners.get(&listener_key) {
                     None => {
                         // spawn the task, it is not present
                         let (config_tx, config_rx) = watch::channel(config);
-                        listeners.insert(listen_addr, config_tx);
+                        listeners.insert(listener_key, config_tx);
                         let mut runner = LBRunner {
-                            listen_addr,
+                            listener_key,
                             config_rx,
                             tasks_counter: self.tasks_running.clone(),
                         };
@@ -75,7 +76,7 @@ impl LBAppContext {
                             if let Err(err) = runner.run().await {
                                 error!(
                                     "Listener {} exited abruptly: {:?}",
-                                    runner.listen_addr, err
+                                    runner.listener_key, err
                                 );
                             }
                         });
@@ -91,15 +92,30 @@ impl LBAppContext {
 }
 
 pub struct LBRunner {
-    pub listen_addr: SocketAddr,
+    pub listener_key: ListenerKey,
     pub config_rx: watch::Receiver<Arc<Rule>>,
     tasks_counter: Arc<AtomicUsize>,
 }
 
 impl LBRunner {
-    #[instrument(level= "info", name = "lb", skip_all, fields(listen_addr = %self.listen_addr, protocol = ?self.config_rx.borrow().protocol))]
+    #[instrument(level= "info", name = "lb", skip_all, fields(listen_addr = %self.listener_key.addr, protocol = ?self.config_rx.borrow().protocol))]
     pub async fn run(&mut self) -> anyhow::Result<()> {
-        let tcp_server = create_socket(self.listen_addr)?;
+        let protocol = self.config_rx.borrow().protocol;
+        match protocol {
+            Protocol::Tcp | Protocol::Tls => self.run_tcp().await,
+            Protocol::Udp => {
+                run_udp_listener(
+                    self.listener_key.addr,
+                    self.config_rx.clone(),
+                    self.tasks_counter.clone(),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn run_tcp(&mut self) -> anyhow::Result<()> {
+        let tcp_server = create_socket(self.listener_key.addr)?;
         tcp_server.listen(4096)?;
         let tcp_server = TcpListener::from_std(std::net::TcpListener::from(tcp_server))?;
         let mut rule = self.config_rx.borrow_and_update().clone();

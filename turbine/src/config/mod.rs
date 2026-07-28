@@ -1,4 +1,4 @@
-use crate::config::types::{BackendDiscovery, Config};
+use crate::config::types::{BackendDiscovery, Config, ListenerKey};
 use crate::load_balancing_strategy::{Backend, LoadBalancingStrategy};
 use crate::{tls, Rule, Upstream, LOCAL_ADDR_V4};
 use anyhow::Context;
@@ -8,7 +8,6 @@ use parking_lot::Mutex;
 use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::BufReader;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,13 +16,14 @@ use tracing::{debug, error, info};
 
 pub mod types;
 
-pub fn parse_config(config_path: &Path) -> anyhow::Result<HashMap<SocketAddr, Arc<Rule>>> {
+pub fn parse_config(config_path: &Path) -> anyhow::Result<HashMap<ListenerKey, Arc<Rule>>> {
     let config: Config = serde_yaml::from_reader(BufReader::new(File::open(config_path)?))?;
-    let rules: HashMap<SocketAddr, Arc<Rule>> = config
+    let rules: HashMap<ListenerKey, Arc<Rule>> = config
         .rules
         .into_iter()
         .flat_map(|mut x| {
             let listen_addr = std::mem::replace(&mut x.listen_addr, NonEmpty::new(LOCAL_ADDR_V4));
+            let is_udp = x.protocol.is_udp();
             let ups =
                 x.upstreams
                     .into_iter()
@@ -76,7 +76,7 @@ pub fn parse_config(config_path: &Path) -> anyhow::Result<HashMap<SocketAddr, Ar
 
             listen_addr
                 .into_iter()
-                .map(move |addr| (addr, rule.clone()))
+                .map(move |addr| (ListenerKey { addr, is_udp }, rule.clone()))
         })
         .collect();
 
@@ -89,13 +89,13 @@ pub struct ConfigWatcher {
 
 struct ConfigWatcherInner {
     watcher: notify::PollWatcher,
-    config_tx: mpsc::Sender<HashMap<SocketAddr, Arc<Rule>>>,
+    config_tx: mpsc::Sender<HashMap<ListenerKey, Arc<Rule>>>,
 }
 
 impl ConfigWatcher {
     pub fn new(
         config_path: PathBuf,
-        config_tx: mpsc::Sender<HashMap<SocketAddr, Arc<Rule>>>,
+        config_tx: mpsc::Sender<HashMap<ListenerKey, Arc<Rule>>>,
     ) -> anyhow::Result<Self> {
         let watcher_config = notify::Config::default()
             .with_poll_interval(Duration::from_secs(1))

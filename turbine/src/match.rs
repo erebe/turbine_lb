@@ -27,6 +27,14 @@ impl MatchContext {
         }
     }
 
+    pub fn for_destination(destination: SocketAddr) -> Self {
+        Self {
+            sni: None,
+            alpns: None,
+            destination,
+        }
+    }
+
     #[inline]
     pub fn find_matching_upstream<'a>(
         &'_ self,

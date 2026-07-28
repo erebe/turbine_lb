@@ -5,11 +5,12 @@
 
 # Features
 
-* TCP and TLS load-balancing
+* TCP, TLS and UDP load-balancing
 * TLS sni inspection for routing (without terminating TLS)
 * TLS termination with KTLS
-* "zero-copy" using splice syscall
-* support proxy protocol v2
+* "zero-copy" using splice syscall (TCP/TLS)
+* per-client UDP session tracking with idle timeout
+* support proxy protocol v2 (TCP/TLS)
 * auto reload config and certificate
 * linux only
 

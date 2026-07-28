@@ -13,10 +13,10 @@ mod r#match;
 mod peekable_stream;
 mod splice_strategy;
 mod tls;
+mod udp;
 
 use anyhow::Context;
 use clap::Parser;
-use ktls::KtlsStream;
 use nonempty::NonEmpty;
 
 use crate::config::types::{Protocol, UpstreamConfig};
@@ -27,31 +27,28 @@ use crate::r#match::MatchContext;
 use rustls::pki_types::DnsName;
 use rustls::server::Acceptor;
 use socket2::{Domain, SockAddr, SockRef, TcpKeepalive};
-use std::io::{Error, IoSlice};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::atomic::Ordering;
-use std::task::Poll;
 use std::time::Duration;
 
 use crate::peekable_stream::PeekableStream;
 use crate::splice_strategy::splice::SpliceSyscall;
 use crate::splice_strategy::SocketSplice;
 use crate::tls::ProtocolName;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, Interest, ReadBuf};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 use tokio::{pin, select};
 use tokio_rustls::TlsAcceptor;
-use tokio_splice::{zero_copy_bidirectional, Stream};
+use tokio_splice::zero_copy_bidirectional;
 use tracing::{debug, info, warn, Span};
 use tracing_subscriber::EnvFilter;
 
-const LOCAL_ADDR_V6: SocketAddr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0));
-const LOCAL_ADDR_V4: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
+pub const LOCAL_ADDR_V6: SocketAddr =
+    SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0));
+pub const LOCAL_ADDR_V4: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
 
 struct Rule {
     pub protocol: Protocol,
@@ -188,6 +185,20 @@ fn create_socket(bind: SocketAddr) -> anyhow::Result<socket2::Socket> {
     Ok(sock)
 }
 
+pub fn create_udp_socket(bind: SocketAddr) -> anyhow::Result<socket2::Socket> {
+    let sock = socket2::Socket::new(
+        Domain::for_address(bind),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    sock.set_reuse_address(true)?;
+    sock.set_reuse_port(true)?;
+    sock.set_nonblocking(true)?;
+    sock.bind(&SockAddr::from(bind))?;
+
+    Ok(sock)
+}
+
 async fn handle_client(
     local: &Rule,
     mut stream: TcpStream,
@@ -209,6 +220,7 @@ async fn handle_client(
             MatchContext::new(&stream, sni, alpns)
         }
         Protocol::Tcp => MatchContext::new(&stream, None, None),
+        Protocol::Udp => unreachable!("UDP is handled by run_udp_listener, not handle_client"),
     };
 
     // Select the correct upstream based on matches

@@ -10,6 +10,33 @@ use std::time::Duration;
 pub enum Protocol {
     Tcp,
     Tls,
+    Udp,
+}
+
+impl Protocol {
+    pub fn is_udp(self) -> bool {
+        matches!(self, Protocol::Udp)
+    }
+}
+
+/// Identifies a distinct listener. TCP/TLS share the same kernel port
+/// space, so they collide on the same `SocketAddr`; UDP has its own port
+/// space and can coexist with TCP/TLS on the same address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ListenerKey {
+    pub addr: SocketAddr,
+    pub is_udp: bool,
+}
+
+impl std::fmt::Display for ListenerKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}/{}",
+            self.addr,
+            if self.is_udp { "udp" } else { "tcp" }
+        )
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
